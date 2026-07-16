@@ -82,6 +82,17 @@ declare "kubernetes" {
 		}
 	}
 
+	// Scrape Prometheus-Operator PodMonitor CRDs scoped to this tenant's namespaces.
+	prometheus.operator.podmonitors "pm" {
+		forward_to = [prometheus.remote_write.default.receiver]
+		namespaces = argument.namespaces.value
+
+		// Split PodMonitor targets across the Alloy cluster.
+		clustering {
+			enabled = true
+		}
+	}
+
 	discovery.kubernetes "pods" {
 		role = "pod"
 		namespaces {
