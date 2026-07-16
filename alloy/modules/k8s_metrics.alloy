@@ -1,0 +1,188 @@
+// k8s_metrics
+//
+// Per-tenant Kubernetes workload metrics. In the given namespaces it scrapes
+// both:
+//   - annotated pods (prometheus.io/scrape: "true"), honouring the standard
+//     prometheus.io/{path,port,scheme} annotations, and
+//   - Prometheus-Operator ServiceMonitor CRDs,
+// then remote-writes them to a Prometheus-compatible backend (e.g. Mimir)
+// under a dedicated tenant (X-Scope-OrgID). Instantiated once per tenant.
+//
+// This is the per-tenant workload counterpart to host_metrics (which is
+// per-node and single-tenant). Pod and ServiceMonitor scraping are clustered,
+// so targets are split across the Alloy peers.
+//
+// Features:
+//   - Annotation-driven pod discovery + ServiceMonitor CRD scraping.
+//   - Standard identifying labels (namespace, pod, container, node).
+//   - Optional project_label to promote an arbitrary pod meta-label to a
+//     project_name label (site-specific; disabled by default).
+//   - Stamps region / zone / cluster_name external labels.
+//   - Embedded remote_write so the tenant (X-Scope-OrgID) is set per instance.
+//
+// Requirements:
+//   - RBAC: get/list/watch on pods, services, endpoints and the monitoring
+//     ServiceMonitor CRD.
+//
+// Usage:
+//   k8s_metrics.kubernetes "my_tenant" {
+//       namespaces                   = ["my-namespace"]
+//       tenant_id                    = "my-tenant"
+//       endpoint_url                 = sys.env("MIMIR_ENDPOINT_URL")
+//       endpoint_basic_auth_username = sys.env("AUTH_BASIC_USERNAME")
+//       endpoint_basic_auth_password = sys.env("AUTH_BASIC_PASSWORD")
+//       region                       = sys.env("REGION")
+//       zone                         = sys.env("ZONE")
+//       cluster_name                 = sys.env("CLUSTER_NAME")
+//   }
+declare "kubernetes" {
+	// -- Required -----------------------------------------------------------
+	argument "namespaces" {
+		comment = "The namespaces to look for targets in"
+	}
+	argument "tenant_id" {
+		comment = "The tenant (X-Scope-OrgID) to write metrics to"
+	}
+	argument "endpoint_url" {
+		comment = "Prometheus-compatible remote_write URL (e.g. Mimir)"
+	}
+	argument "endpoint_basic_auth_username" {
+		comment = "Basic-auth username for the remote_write endpoint"
+	}
+	argument "endpoint_basic_auth_password" {
+		comment = "Basic-auth password for the remote_write endpoint"
+	}
+
+	// -- Optional -----------------------------------------------------------
+	argument "project_label" {
+		comment  = "Pod meta-label to map to a project_name label, e.g. \"__meta_kubernetes_pod_label_app_kubernetes_io_part_of\". Empty disables it (default: \"\")"
+		optional = true
+	}
+	argument "region" {
+		comment  = "Value for the region external label (default: \"\", unset)"
+		optional = true
+	}
+	argument "zone" {
+		comment  = "Value for the zone external label (default: \"\", unset)"
+		optional = true
+	}
+	argument "cluster_name" {
+		comment  = "Value for the cluster_name external label (default: \"\", unset)"
+		optional = true
+	}
+
+	// Scrape ServiceMonitor CRDs scoped to this tenant's namespaces.
+	prometheus.operator.servicemonitors "sm" {
+		forward_to = [prometheus.remote_write.default.receiver]
+		namespaces = argument.namespaces.value
+
+		// Split ServiceMonitor targets across the Alloy cluster.
+		clustering {
+			enabled = true
+		}
+	}
+
+	discovery.kubernetes "pods" {
+		role = "pod"
+		namespaces {
+			names = argument.namespaces.value
+		}
+	}
+
+	discovery.relabel "pods" {
+		targets = discovery.kubernetes.pods.targets
+
+		// Only scrape pods explicitly opted in via annotation.
+		rule {
+			source_labels = ["__meta_kubernetes_pod_annotation_prometheus_io_scrape"]
+			regex         = "true"
+			action        = "keep"
+		}
+
+		// Honour a custom metrics path annotation.
+		rule {
+			source_labels = ["__meta_kubernetes_pod_annotation_prometheus_io_path"]
+			regex         = "(.+)"
+			target_label  = "__metrics_path__"
+			action        = "replace"
+		}
+
+		// Honour a custom scrape port annotation.
+		rule {
+			source_labels = ["__address__", "__meta_kubernetes_pod_annotation_prometheus_io_port"]
+			regex         = "([^:]+)(?::\\d+)?;(\\d+)"
+			replacement   = "$1:$2"
+			target_label  = "__address__"
+			action        = "replace"
+		}
+
+		// Honour a custom scheme annotation (http/https).
+		rule {
+			source_labels = ["__meta_kubernetes_pod_annotation_prometheus_io_scheme"]
+			regex         = "(https?)"
+			target_label  = "__scheme__"
+			action        = "replace"
+		}
+
+		// Standard identifying labels.
+		rule {
+			source_labels = ["__meta_kubernetes_namespace"]
+			target_label  = "namespace"
+		}
+		rule {
+			source_labels = ["__meta_kubernetes_pod_name"]
+			target_label  = "pod"
+		}
+		rule {
+			source_labels = ["__meta_kubernetes_pod_container_name"]
+			target_label  = "container"
+		}
+		rule {
+			source_labels = ["__meta_kubernetes_pod_node_name"]
+			target_label  = "node"
+		}
+
+		// Optional: promote a site-specific pod meta-label to project_name.
+		// Defaults to a meta-label that never exists, so the label stays unset
+		// unless a caller passes project_label.
+		rule {
+			source_labels = [coalesce(argument.project_label.value, "__meta_kubernetes_pod_label_k8s_metrics_unset")]
+			action        = "replace"
+			target_label  = "project_name"
+		}
+	}
+
+	prometheus.scrape "pods" {
+		targets    = discovery.relabel.pods.output
+		forward_to = [prometheus.remote_write.default.receiver]
+
+		scrape_interval = "30s"
+		scrape_timeout  = "10s"
+
+		// Split annotated-pod targets across the Alloy cluster.
+		clustering {
+			enabled = true
+		}
+	}
+
+	prometheus.remote_write "default" {
+		endpoint {
+			url = argument.endpoint_url.value
+
+			basic_auth {
+				username = argument.endpoint_basic_auth_username.value
+				password = argument.endpoint_basic_auth_password.value
+			}
+
+			headers = {
+				"X-Scope-OrgID" = argument.tenant_id.value,
+			}
+		}
+
+		external_labels = {
+			region       = coalesce(argument.region.value, ""),
+			zone         = coalesce(argument.zone.value, ""),
+			cluster_name = coalesce(argument.cluster_name.value, ""),
+		}
+	}
+}

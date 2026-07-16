@@ -1,0 +1,137 @@
+// host_metrics
+//
+// Collect host-level (node) metrics via the embedded node_exporter
+// (prometheus.exporter.unix) and remote-write them to a Prometheus-compatible
+// backend (e.g. Mimir) under a single tenant. Because each instance reads its
+// own node's /proc, /sys and root filesystem via host mounts and scrapes only
+// the local exporter, it is inherently node-local and is meant to run as a
+// DaemonSet.
+//
+// This is deliberately single-tenant and node-scoped: clustering is disabled
+// so scrapes are NOT distributed across peers (that would scatter the series
+// and break the instance=node mapping). For per-tenant workload metrics use
+// the k8s_metrics module instead.
+//
+// Features:
+//   - Self-contained per-node collector (host root/proc/sys via mounts).
+//   - Stamps instance and node labels from the local node name.
+//   - Stamps region / zone / cluster_name external labels.
+//   - Embedded remote_write so the tenant (X-Scope-OrgID) is set per instance.
+//
+// Requirements:
+//   - Host /, /proc and /sys mounted read-only into the collector at
+//     /host/root, /host/proc and /host/sys respectively.
+//   - K8S_NODE_NAME exposed to the collector (the Grafana Alloy Helm chart
+//     injects this automatically from spec.nodeName); or pass node_name.
+//
+// Usage:
+//   host_metrics.unix "node" {
+//       tenant_id                    = "my-tenant"
+//       endpoint_url                 = sys.env("MIMIR_ENDPOINT_URL")
+//       endpoint_basic_auth_username = sys.env("AUTH_BASIC_USERNAME")
+//       endpoint_basic_auth_password = sys.env("AUTH_BASIC_PASSWORD")
+//       region                       = sys.env("REGION")
+//       zone                         = sys.env("ZONE")
+//       cluster_name                 = sys.env("CLUSTER_NAME")
+//   }
+declare "unix" {
+	// -- Required -----------------------------------------------------------
+	argument "tenant_id" {
+		comment = "The tenant (X-Scope-OrgID) to write node metrics to"
+	}
+	argument "endpoint_url" {
+		comment = "Prometheus-compatible remote_write URL (e.g. Mimir)"
+	}
+	argument "endpoint_basic_auth_username" {
+		comment = "Basic-auth username for the remote_write endpoint"
+	}
+	argument "endpoint_basic_auth_password" {
+		comment = "Basic-auth password for the remote_write endpoint"
+	}
+
+	// -- Optional -----------------------------------------------------------
+	argument "node_name" {
+		comment  = "Node name for the instance/node labels (default: sys.env(\"K8S_NODE_NAME\"), injected by the Alloy Helm chart)"
+		optional = true
+	}
+	argument "region" {
+		comment  = "Value for the region external label (default: \"\", unset)"
+		optional = true
+	}
+	argument "zone" {
+		comment  = "Value for the zone external label (default: \"\", unset)"
+		optional = true
+	}
+	argument "cluster_name" {
+		comment  = "Value for the cluster_name external label (default: \"\", unset)"
+		optional = true
+	}
+
+	prometheus.exporter.unix "node" {
+		rootfs_path = "/host/root"
+		procfs_path = "/host/proc"
+		sysfs_path  = "/host/sys"
+
+		// The xfs collector fails to parse /proc/fs/xfs/stat on some kernels
+		// ("xpc" line is not a uint), erroring on every scrape. It yields no
+		// useful series here, so disable it.
+		disable_collectors = ["xfs"]
+
+		filesystem {
+			mount_points_exclude = "^/(dev|proc|sys|var/lib/docker/.+|var/lib/kubelet/.+)($|/)"
+			fs_types_exclude     = "^(autofs|binfmt_misc|bpf|cgroup2?|configfs|debugfs|devpts|devtmpfs|fusectl|hugetlbfs|iso9660|mqueue|nsfs|overlay|proc|procfs|pstore|rpc_pipefs|securityfs|selinuxfs|squashfs|sysfs|tracefs)$"
+		}
+
+		netclass {
+			ignored_devices = "^(veth.*|cali.*|[a-f0-9]{15})$"
+		}
+	}
+
+	discovery.relabel "node" {
+		targets = prometheus.exporter.unix.node.targets
+
+		// Label every node series with the node it came from.
+		rule {
+			target_label = "instance"
+			replacement  = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"))
+		}
+		rule {
+			target_label = "node"
+			replacement  = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"))
+		}
+	}
+
+	prometheus.scrape "node" {
+		targets    = discovery.relabel.node.output
+		forward_to = [prometheus.remote_write.default.receiver]
+
+		scrape_interval = "30s"
+		scrape_timeout  = "10s"
+
+		// Local exporter only — do not distribute across the cluster.
+		clustering {
+			enabled = false
+		}
+	}
+
+	prometheus.remote_write "default" {
+		endpoint {
+			url = argument.endpoint_url.value
+
+			basic_auth {
+				username = argument.endpoint_basic_auth_username.value
+				password = argument.endpoint_basic_auth_password.value
+			}
+
+			headers = {
+				"X-Scope-OrgID" = argument.tenant_id.value,
+			}
+		}
+
+		external_labels = {
+			region       = coalesce(argument.region.value, ""),
+			zone         = coalesce(argument.zone.value, ""),
+			cluster_name = coalesce(argument.cluster_name.value, ""),
+		}
+	}
+}
