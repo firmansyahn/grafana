@@ -1,0 +1,188 @@
+// k8s_alert
+//
+// Per-tenant alerting/recording rule sync. Discovers Prometheus-Operator
+// PrometheusRule CRDs in the given namespaces and reconciles them into the
+// Mimir ruler (metric rules) and the Loki ruler (log rules), each under a
+// dedicated tenant (X-Scope-OrgID). The rulers evaluate the rules and dispatch
+// alerts to Alertmanager -- Alloy only SYNCS the rules, it does not evaluate
+// them or talk to Alertmanager itself.
+//
+// Flow:
+//   PrometheusRule CRD (tenant ns)
+//     -> k8s_alert (this module): discover + sync
+//        -> Mimir ruler / Loki ruler: evaluate
+//           -> Alertmanager: dispatch
+//
+// This is the alerting-rules sibling of k8s_metrics: same per-tenant,
+// namespace-scoped shape, instantiated once per .Values.obsTenants entry.
+//
+// Two independent declares -- instantiate whichever backends you have:
+//   - k8s_alert.metrics -> Mimir ruler (PromQL alerting/recording rules)
+//   - k8s_alert.logs    -> Loki ruler  (LogQL alerting/recording rules)
+// They are separate so a cluster with only one ruler instantiates only that
+// one, and so a broken/absent ruler on one backend cannot stop rule sync on
+// the other.
+//
+// Rule routing is by LABEL, not by expression language. This is load-bearing:
+// the Loki ruler does NOT silently ignore PromQL -- it tries to parse every
+// discovered rule's expr as LogQL and hard-fails on PromQL (and vice versa). So
+// a PrometheusRule CRD must reach only the ruler whose language it holds. The
+// `grafana.com/rules-type` label controls this, with a Mimir-default bias:
+//   - label absent or any value != "logs" -> Mimir ruler only (the default, so
+//     plain PromQL CRDs need no label and keep working)
+//   - grafana.com/rules-type=logs          -> Loki ruler only (explicit opt-in)
+// A CRD must hold ONLY one backend's rules: put PromQL alerting/recording rules
+// in an unlabelled (or =metrics) CRD, and LogQL rules in a separate =logs CRD.
+// A mixed CRD would error on whichever ruler its label does not exclude.
+//
+// Namespace scoping is by label too: rule_namespace_selector matches the built-
+// in kubernetes.io/metadata.name label (present on every namespace) against this
+// tenant's namespace list.
+//
+// Requirements:
+//   - RBAC: get/list/watch on the PrometheusRule CRD and namespaces.
+//   - A reachable Mimir ruler (for .metrics) and/or Loki ruler (for .logs).
+//
+// Usage (instantiate one or both):
+//   k8s_alert.metrics "my_tenant" {
+//       namespaces                   = ["my-namespace"]
+//       tenant_id                    = "my-tenant"
+//       ruler_endpoint               = sys.env("MIMIR_ENDPOINT")
+//       endpoint_basic_auth_username = sys.env("AUTH_BASIC_USERNAME")
+//       endpoint_basic_auth_password = sys.env("AUTH_BASIC_PASSWORD")
+//   }
+//   k8s_alert.logs "my_tenant" {
+//       namespaces                   = ["my-namespace"]
+//       tenant_id                    = "my-tenant"
+//       ruler_endpoint               = sys.env("LOKI_ENDPOINT")
+//       endpoint_basic_auth_username = sys.env("AUTH_BASIC_USERNAME")
+//       endpoint_basic_auth_password = sys.env("AUTH_BASIC_PASSWORD")
+//   }
+// metrics and logs are split into two independent declares (rather than one
+// that hardcodes both rulers) so a caller instantiates ONLY the backends it
+// has. Alloy has no way to conditionally skip a component with an empty address
+// -- a mimir.rules.kubernetes / loki.rules.kubernetes with address="" fails at
+// load -- so "skip a ruler" means "don't instantiate that declare". This also
+// isolates health: a broken or absent Loki ruler cannot stop metric-rule sync
+// to Mimir (and vice versa), which matters because the two backends fail
+// independently.
+
+// k8s_alert.metrics -- metric alerting/recording rules -> Mimir ruler.
+declare "metrics" {
+	// -- Required -----------------------------------------------------------
+	argument "namespaces" {
+		comment = "The namespaces to discover PrometheusRule CRDs in"
+	}
+	argument "tenant_id" {
+		comment = "The tenant (X-Scope-OrgID) the rules are synced under"
+	}
+	argument "ruler_endpoint" {
+		comment = "Mimir ruler endpoint for metric alerting/recording rules"
+	}
+	argument "endpoint_basic_auth_username" {
+		comment = "Basic-auth username for the ruler endpoint"
+	}
+	argument "endpoint_basic_auth_password" {
+		comment = "Basic-auth password for the ruler endpoint"
+	}
+
+	// -- Optional -----------------------------------------------------------
+	argument "sync_interval" {
+		comment  = "How often to reconcile CRDs into the ruler (default: \"5m\")"
+		optional = true
+	}
+
+	mimir.rules.kubernetes "metrics" {
+		address   = argument.ruler_endpoint.value
+		tenant_id = argument.tenant_id.value
+
+		sync_interval = coalesce(argument.sync_interval.value, "5m")
+
+		basic_auth {
+			username = argument.endpoint_basic_auth_username.value
+			password = argument.endpoint_basic_auth_password.value
+		}
+
+		// Keep only this tenant's namespaces, matched on the built-in
+		// kubernetes.io/metadata.name label (present on every namespace).
+		rule_namespace_selector {
+			match_expression {
+				key      = "kubernetes.io/metadata.name"
+				operator = "In"
+				values   = argument.namespaces.value
+			}
+		}
+
+		// Pull every PrometheusRule EXCEPT those explicitly labelled as log
+		// rules. NotIn matches when the label is absent or any value other than
+		// "logs", so plain PromQL CRDs (unlabelled) and metrics-labelled CRDs
+		// both sync to Mimir; only grafana.com/rules-type=logs is excluded. This
+		// keeps the default backward-compatible: a rule author must opt IN to
+		// the Loki ruler with the logs label, but needs no label for Mimir.
+		rule_selector {
+			match_expression {
+				key      = "grafana.com/rules-type"
+				operator = "NotIn"
+				values   = ["logs"]
+			}
+		}
+	}
+}
+
+// k8s_alert.logs -- log alerting/recording rules -> Loki ruler. Discovers only
+// PrometheusRule CRDs labelled grafana.com/rules-type=logs (LogQL); PromQL CRDs
+// are routed to the Mimir declare above.
+declare "logs" {
+	// -- Required -----------------------------------------------------------
+	argument "namespaces" {
+		comment = "The namespaces to discover PrometheusRule CRDs in"
+	}
+	argument "tenant_id" {
+		comment = "The tenant (X-Scope-OrgID) the rules are synced under"
+	}
+	argument "ruler_endpoint" {
+		comment = "Loki ruler endpoint for log alerting/recording rules"
+	}
+	argument "endpoint_basic_auth_username" {
+		comment = "Basic-auth username for the ruler endpoint"
+	}
+	argument "endpoint_basic_auth_password" {
+		comment = "Basic-auth password for the ruler endpoint"
+	}
+
+	// -- Optional -----------------------------------------------------------
+	argument "sync_interval" {
+		comment  = "How often to reconcile CRDs into the ruler (default: \"5m\")"
+		optional = true
+	}
+
+	loki.rules.kubernetes "logs" {
+		address   = argument.ruler_endpoint.value
+		tenant_id = argument.tenant_id.value
+
+		sync_interval = coalesce(argument.sync_interval.value, "5m")
+
+		basic_auth {
+			username = argument.endpoint_basic_auth_username.value
+			password = argument.endpoint_basic_auth_password.value
+		}
+
+		rule_namespace_selector {
+			match_expression {
+				key      = "kubernetes.io/metadata.name"
+				operator = "In"
+				values   = argument.namespaces.value
+			}
+		}
+
+		// Only pull PrometheusRule CRDs labelled as log rules. Prevents the Loki
+		// ruler from trying (and failing) to parse PromQL rules as LogQL.
+		rule_selector {
+			match_expression {
+				key      = "grafana.com/rules-type"
+				operator = "In"
+				values   = ["logs"]
+			}
+		}
+	}
+}

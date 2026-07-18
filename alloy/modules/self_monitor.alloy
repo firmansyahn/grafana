@@ -1,0 +1,180 @@
+// self_monitor -- Alloy meta-monitoring.
+//
+// Ships Alloy's own internal telemetry to the observability stack so a silent
+// pipeline failure is visible.
+//
+// Three signals:
+//   - Metrics: collected via prometheus.exporter.self, scraped by a dedicated
+//     NON-clustered prometheus.scrape, and remote_written to Mimir with an
+//     X-Scope-OrgID header. The scrape opts out of clustering on purpose:
+//     prometheus.exporter.self sets instance=<hostname>, which differs per
+//     node -- consistent-hash target distribution would assign all of them to
+//     one node. A dedicated non-clustered scrape means every DaemonSet pod
+//     scrapes its OWN self-metrics (per-node collector health, what we want).
+//
+//   - Logs:   fanned in from the top-level `logging.write_to`, enriched with
+//     cluster/region/zone static labels, and pushed to Loki under the same
+//     tenant.
+//
+//   - Traces: fanned in from the top-level `tracing.write_to` and exported
+//     to Tempo (OTLP gRPC) under the same tenant header.
+//
+// Top-level `logging` and `tracing` blocks are singletons and cannot live
+// inside a declare, so this module exposes log/traces receivers as exports
+// for the importer to wire into its `write_to` arguments. Metrics are fully
+// self-contained.
+//
+// Usage (the write_to references must include the instance label -- "alloy"
+// below -- since exports live on the instance, e.g.
+// self_monitor.default.alloy.logs_receiver):
+//   logging { write_to = [self_monitor.default.alloy.logs_receiver] }
+//   tracing { write_to = [self_monitor.default.alloy.traces_input] }
+//
+//   self_monitor.default "alloy" {
+//       tenant_id           = "my-tenant"
+//       metrics_endpoint    = sys.env("MIMIR_ENDPOINT_URL")
+//       logs_endpoint       = sys.env("LOKI_ENDPOINT_URL")
+//       traces_endpoint     = sys.env("OTLP_CLIENT_ENDPOINT")
+//       basic_auth_username = sys.env("AUTH_BASIC_USERNAME")
+//       basic_auth_password = sys.env("AUTH_BASIC_PASSWORD")
+//       cluster_name        = sys.env("CLUSTER_NAME")
+//       region              = sys.env("REGION")
+//       zone                = sys.env("ZONE")
+//   }
+declare "default" {
+	// -- Required -----------------------------------------------------------
+	// Tenant (X-Scope-OrgID) for all three sinks. Mimir via remote_write
+	// headers, Loki via loki.write.endpoint.tenant_id, Tempo via the
+	// otelcol.exporter.otlp client headers.
+	argument "tenant_id" {
+		comment = "The tenant (X-Scope-OrgID) for metrics, logs, and traces"
+	}
+	argument "metrics_endpoint" {
+		comment = "Mimir push URL for self-metrics (e.g. https://mimir.../api/v1/push)"
+	}
+	argument "logs_endpoint" {
+		comment = "Loki push URL for self-logs (e.g. https://loki.../loki/api/v1/push)"
+	}
+	argument "traces_endpoint" {
+		comment = "OTLP gRPC endpoint for self-traces (e.g. tempo...:4317)"
+	}
+	argument "basic_auth_username" {
+		comment = "Basic-auth username for metrics and logs endpoints"
+	}
+	argument "basic_auth_password" {
+		comment = "Basic-auth password for metrics and logs endpoints"
+	}
+
+	// -- Optional -----------------------------------------------------------
+	argument "cluster_name" {
+		comment  = "Value for the cluster_name external label on metrics, and a static label on logs (default: \"\", unset)"
+		optional = true
+	}
+	argument "region" {
+		comment  = "Value for the region external label on metrics, and a static label on logs (default: \"\", unset)"
+		optional = true
+	}
+	argument "zone" {
+		comment  = "Value for the zone external label on metrics, and a static label on logs (default: \"\", unset)"
+		optional = true
+	}
+
+	// ----- Metrics: fully self-contained -------------------------------------
+	// Self-internal metrics (loki_process_dropped_lines_total, remote_write
+	// queue/failure counters, otelcol receiver refusals, WAL state, etc.).
+	prometheus.exporter.self "alloy" { }
+
+	prometheus.scrape "alloy" {
+		targets    = prometheus.exporter.self.alloy.targets
+		forward_to = [prometheus.remote_write.alloy.receiver]
+
+		clustering {
+			enabled = false
+		}
+	}
+
+	prometheus.remote_write "alloy" {
+		endpoint {
+			url = argument.metrics_endpoint.value
+
+			basic_auth {
+				username = argument.basic_auth_username.value
+				password = argument.basic_auth_password.value
+			}
+
+			headers = {
+				"X-Scope-OrgID" = argument.tenant_id.value,
+			}
+		}
+
+		external_labels = {
+			cluster_name = coalesce(argument.cluster_name.value, ""),
+			region       = coalesce(argument.region.value, ""),
+			zone         = coalesce(argument.zone.value, ""),
+		}
+	}
+
+	// ----- Logs: entered from top-level `logging.write_to` ------------------
+	// the top-level `logging` block tees Alloy's own log entries here via
+	// stage.static_labels -- cluster/region/zone for queryability in Loki.
+	loki.process "alloy" {
+		forward_to = [loki.write.alloy.receiver]
+
+		stage.static_labels {
+			values = {
+				cluster_name = coalesce(argument.cluster_name.value, ""),
+				region       = coalesce(argument.region.value, ""),
+				zone         = coalesce(argument.zone.value, ""),
+			}
+		}
+	}
+
+	loki.write "alloy" {
+		endpoint {
+			url = argument.logs_endpoint.value
+
+			basic_auth {
+				username = argument.basic_auth_username.value
+				password = argument.basic_auth_password.value
+			}
+
+			tenant_id = argument.tenant_id.value
+		}
+	}
+
+	export "logs_receiver" {
+		value = loki.process.alloy.receiver
+	}
+
+	// ----- Traces: entered from top-level `tracing.write_to` -----------------
+	// The top-level `tracing` block tees Alloy's own spans here. We export as
+	// OTLP gRPC under the same tenant header. Basic auth shared with the
+	// metrics/logs sinks via a single auth.basic handler; the X-Scope-OrgID
+	// header is added per-export since it identifies the tenant.
+	otelcol.processor.batch "alloy" {
+		output {
+			traces = [otelcol.exporter.otlp.alloy.input]
+		}
+	}
+
+	otelcol.exporter.otlp "alloy" {
+		client {
+			endpoint = argument.traces_endpoint.value
+
+			headers = {
+				"X-Scope-OrgID" = argument.tenant_id.value,
+			}
+
+			auth = otelcol.auth.basic.default.handler
+		}
+	}
+
+	otelcol.auth.basic "default" {
+		username = argument.basic_auth_username.value
+		password = argument.basic_auth_password.value
+	}
+
+	export "traces_input" {
+		value = otelcol.processor.batch.alloy.input
+	}
+}
