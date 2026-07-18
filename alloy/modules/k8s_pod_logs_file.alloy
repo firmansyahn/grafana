@@ -10,8 +10,16 @@
 //   - Node-local discovery via a spec.nodeName field selector.
 //   - Runtime-aware parsing: auto-detects containerd/cri-o vs docker and
 //     applies stage.cri or stage.docker accordingly.
+//   - Collapses multi-line records (stack traces) into one entry (stage.multiline).
 //   - Promotes the `stream` (stdout/stderr) and a normalized `level` label.
+//   - Indexed stream labels: namespace, app, container, node, job,
+//     project_name, stream, level, cluster_name.
+//   - Demotes high-cardinality pod + node_ip to structured metadata (queryable
+//     at query time, not indexed), and drops the auto-attached `filename`.
 //   - Multi-tenant: stamps the Loki tenant via stage.tenant.
+//
+// Requires Loki with allow_structured_metadata: true (tsdb + schema v13) for
+// the pod/node_ip structured metadata.
 //
 // This module intentionally does NOT redact or drop lines — those rules are
 // site-specific. To add them, point `forward_to` at your own loki.process
@@ -60,6 +68,11 @@ declare "kubernetes" {
 		optional = true
 	}
 
+	argument "multiline_firstline" {
+		comment  = "Regex matching the FIRST line of a multi-line record; non-matching lines fold into the previous entry. Tune per workload log format (default matches ISO/RFC3339 timestamps and klog [IWEF]MMDD prefixes)"
+		optional = true
+	}
+
 	discovery.kubernetes "pods" {
 		role = "pod"
 
@@ -84,6 +97,20 @@ declare "kubernetes" {
 			target_label  = "namespace"
 		}
 
+		// pod is set here as a temporary label so it is available in the pipeline,
+		// then demoted to structured metadata in loki.process (stage.
+		// structured_metadata) rather than kept as an indexed stream label. Pod
+		// names embed the ReplicaSet hash + suffix, so as a label they are
+		// high-cardinality churn (a new stream per pod, per restart). Structured
+		// metadata keeps them queryable at query time without the index cost.
+		// This is the identity that distinguishes same-Deployment replicas
+		// co-located on one node (node alone does not).
+		rule {
+			source_labels = ["__meta_kubernetes_pod_name"]
+			action        = "replace"
+			target_label  = "pod"
+		}
+
 		rule {
 			source_labels = ["__meta_kubernetes_pod_node_name"]
 			action        = "replace"
@@ -102,9 +129,24 @@ declare "kubernetes" {
 			target_label  = "container"
 		}
 
+		// app is the workload name. Prefer the app.kubernetes.io/name label; when
+		// a pod does not set it, fall back to the container name so app is never
+		// empty. The second rule only overwrites app when the first left it
+		// empty: it joins the current app value and the container name with ";"
+		// and its regex "^;(.+)$" matches only when app is empty (nothing before
+		// the separator), replacing app with the container name.
 		rule {
 			source_labels = ["__meta_kubernetes_pod_label_app_kubernetes_io_name"]
 			action        = "replace"
+			target_label  = "app"
+		}
+
+		rule {
+			source_labels = ["app", "__meta_kubernetes_pod_container_name"]
+			action        = "replace"
+			separator     = ";"
+			regex         = "^;(.+)$"
+			replacement   = "$1"
 			target_label  = "app"
 		}
 
@@ -191,8 +233,33 @@ declare "kubernetes" {
 			}
 		}
 
+		// Drop the temporary runtime hint and the `filename` label that
+		// loki.source.file attaches automatically. The on-disk path embeds the
+		// pod UID and ReplicaSet hash
+		// (…/prd-x_app-598bc587c5-6z2hl_01aa31ed-…/app/0.log), so filename is
+		// effectively unique per pod instance -> one new Loki stream per pod,
+		// churning on every restart/rollout (a cardinality bomb). pod/node_ip are
+		// NOT dropped here -- they are demoted to structured metadata below, which
+		// keeps them queryable without the index cost.
 		stage.label_drop {
-			values = ["tmp_container_runtime"]
+			values = ["tmp_container_runtime", "filename"]
+		}
+
+		// Collapse multi-line log records (stack traces, wrapped panics) into a
+		// single Loki entry. firstline matches the start of a new record; lines
+		// that match neither are treated as continuations of the previous entry.
+		// The default matches an ISO-8601 / RFC3339 timestamp or a klog-style
+		// level+MMDD prefix (e.g. "I0119 ..."); override multiline_firstline per
+		// caller for apps whose lines start differently (e.g. JSON). Bounded so a
+		// pathological stream cannot buffer unboundedly.
+		// max_lines bounds the in-memory buffer PER active stream; on a busy node
+		// with many concurrent streams this multiplies, so keep it modest (128 is
+		// plenty for typical stack traces). max_wait_time caps how long a partial
+		// record is held before flushing.
+		stage.multiline {
+			firstline     = coalesce(argument.multiline_firstline.value, "^(\\d{4}-\\d{2}-\\d{2}[T ]\\d{2}:\\d{2}:\\d{2}|[IWEF]\\d{4}\\s)")
+			max_wait_time = "3s"
+			max_lines     = 128
 		}
 
 		// Log level extraction. Default unknown, detect klog / JSON / logfmt
@@ -343,6 +410,20 @@ declare "kubernetes" {
 		stage.static_labels {
 			values = {
 				cluster_name = coalesce(argument.cluster_name.value, sys.env("CLUSTER_NAME")),
+			}
+		}
+
+		// Demote pod + node_ip from indexed stream labels to structured metadata.
+		// stage.structured_metadata reads the extracted map, which is seeded with
+		// the entry's current labels; adding a label as structured metadata
+		// removes it from the label set. Both are high(ish)-cardinality and
+		// rarely used as stream selectors, but stay queryable at query time
+		// (e.g. `| pod="…"`) without inflating the stream/index cardinality. An
+		// empty value means "look up the extracted field of the same name".
+		stage.structured_metadata {
+			values = {
+				pod     = "",
+				node_ip = "",
 			}
 		}
 
