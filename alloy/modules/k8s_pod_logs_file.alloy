@@ -378,15 +378,17 @@ declare "kubernetes" {
 		}
 
 		// --- Baseline secret redaction -------------------------------------
-		// Base64 image payloads (bloat, not secrets).
+		// Base64 image payloads (bloat, not secrets). Cover explicit data URIs
+		// first, then common JSON field names whose values are either data URIs or
+		// raw base64 blobs with recognizable image magic prefixes.
 		stage.replace {
-			expression = `data:image\/(png|jpe?g|webp);base64,([A-Za-z0-9+\/]+={0,2})`
-			replace    = "[REDUCED]"
+			expression = `(?i)data:image\/(png|jpe?g|gif|webp|bmp|avif|x-icon|svg\+xml);base64,\s*[A-Za-z0-9+\/_-]+={0,2}`
+			replace    = "[REDUCED_IMAGE]"
 		}
 
 		stage.replace {
-			expression = `"imageBase64":"(UklGR[A-Za-z0-9+\/]+={0,2})"`
-			replace    = "[REDUCED]"
+			expression = `(?i)"(imageBase64|image_base64|base64Image|base64_image|image|thumbnail|avatar|photo|picture|signature)"\s*:\s*"(iVBORw0KGgo|\/9j\/|R0lGOD|UklGR|Qk|AAABAA|PD94bWwg|PHN2Zy)[A-Za-z0-9+\/_-]*={0,2}"`
+			replace    = `"$1":"[REDUCED_IMAGE]"`
 		}
 
 		// Auth material commonly leaked in request/response logs.
