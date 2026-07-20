@@ -13,8 +13,9 @@
 //     scrapes its OWN self-metrics (per-node collector health, what we want).
 //
 //   - Logs:   fanned in from the top-level `logging.write_to`, enriched with
-//     cluster/region/zone static labels, and pushed to Loki under the same
-//     tenant.
+//     cluster/region/zone static labels, annotated with the Alloy pod name as
+//     structured metadata (queryable but not indexed), and pushed to Loki under
+//     the same tenant.
 //
 //   - Traces: fanned in from the top-level `tracing.write_to` and exported
 //     to Tempo (OTLP gRPC) under the same tenant header.
@@ -115,8 +116,10 @@ declare "default" {
 	}
 
 	// ----- Logs: entered from top-level `logging.write_to` ------------------
-	// the top-level `logging` block tees Alloy's own log entries here via
-	// stage.static_labels -- cluster/region/zone for queryability in Loki.
+	// the top-level `logging` block tees Alloy's own log entries here. Keep
+	// stable dimensions as indexed labels, but demote pod to structured metadata:
+	// DaemonSet pod names contain rollout/restart suffixes, so indexing them
+	// would churn Loki streams while providing little selector value.
 	loki.process "alloy" {
 		forward_to = [loki.write.alloy.receiver]
 
@@ -124,7 +127,14 @@ declare "default" {
 			values = {
 				cluster_name = coalesce(argument.cluster_name.value, ""),
 				region       = coalesce(argument.region.value, ""),
+				pod          = sys.env("HOSTNAME"),
 				zone         = coalesce(argument.zone.value, ""),
+			}
+		}
+
+		stage.structured_metadata {
+			values = {
+				pod = "",
 			}
 		}
 	}
