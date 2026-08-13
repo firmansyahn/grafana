@@ -78,7 +78,7 @@ declare "unix" {
 		disable_collectors = ["xfs"]
 
 		filesystem {
-			mount_points_exclude = "^/(dev|proc|sys|var/lib/docker/.+|var/lib/kubelet/.+)($|/)"
+			mount_points_exclude = "^/(dev|proc|sys|var/lib/docker/.+|var/lib/kubelet/.+|run/containerd/io\.containerd\.grpc\.v1\.cri/sandboxes/[a-f0-9]{64}/shm)($|/)"
 			fs_types_exclude     = "^(autofs|binfmt_misc|bpf|cgroup2?|configfs|debugfs|devpts|devtmpfs|fusectl|hugetlbfs|iso9660|mqueue|nsfs|overlay|proc|procfs|pstore|rpc_pipefs|securityfs|selinuxfs|squashfs|sysfs|tracefs)$"
 		}
 
