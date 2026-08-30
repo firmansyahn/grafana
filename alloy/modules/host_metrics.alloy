@@ -407,3 +407,227 @@ declare "kubelet" {
 		}
 	}
 }
+
+// control_plane
+//
+// Scrape the LOCAL node's kube-controller-manager (:10257) and kube-scheduler
+// (:10259), and remote-write them under a single tenant. Yields no targets on
+// nodes that are not control-plane nodes, so it is safe to instantiate once
+// across a DaemonSet covering the whole cluster.
+//
+// Why not ServiceMonitors: kube-prometheus-stack's kubeControllerManager and
+// kubeScheduler ServiceMonitors hardcode bearerTokenFile and tlsConfig.caFile.
+// Unlike coreDns/kubeProxy/kubeEtcd, whose bearer token is value-controlled,
+// there is no way to switch them off, and prometheus.operator.servicemonitors
+// rejects both outright now that allow_arbitrary_file_access defaults to
+// false. Same reasoning and same fix as the kubelet declare above.
+//
+// IMPORTANT — bind address:
+//   kubeadm defaults both components to --bind-address=127.0.0.1, which makes
+//   their metrics reachable only from the host's own loopback. Alloy runs in
+//   the pod network namespace, so under that default this module discovers the
+//   targets and every scrape fails with connection refused. The KPS
+//   ServiceMonitors could not reach them either, so this is not a regression
+//   introduced here. To collect these metrics set --bind-address=0.0.0.0 in
+//   /etc/kubernetes/manifests/kube-{controller-manager,scheduler}.yaml on each
+//   control-plane node. Both ports stay protected by the components' own
+//   authn/authz webhooks, so exposing them still requires a token that passes
+//   a SubjectAccessReview.
+//
+// Label shape matches what prometheus-operator produced —
+// job="kube-controller-manager" and job="kube-scheduler" — so existing
+// dashboards and alerts keep working.
+//
+// Requirements:
+//   - RBAC: get/list/watch on nodes, plus get on the /metrics nonResourceURL.
+//     The Alloy Helm chart grants both by default via rbac.clusterRules.
+//   - K8S_NODE_NAME exposed to the collector (the Grafana Alloy Helm chart
+//     injects this automatically from spec.nodeName); or pass node_name.
+//   - Control-plane nodes labelled node-role.kubernetes.io/control-plane.
+//
+// Usage:
+//   host_metrics.control_plane "control_plane" {
+//       tenant_id                    = "my-tenant"
+//       endpoint_url                 = sys.env("MIMIR_ENDPOINT_URL")
+//       endpoint_basic_auth_username = sys.env("AUTH_BASIC_USERNAME")
+//       endpoint_basic_auth_password = sys.env("AUTH_BASIC_PASSWORD")
+//       region                       = sys.env("REGION")
+//       zone                         = sys.env("ZONE")
+//       cluster_name                 = sys.env("CLUSTER_NAME")
+//   }
+declare "control_plane" {
+	// -- Required -----------------------------------------------------------
+	argument "tenant_id" {
+		comment = "The tenant (X-Scope-OrgID) to write control-plane metrics to"
+	}
+	argument "endpoint_url" {
+		comment = "Prometheus-compatible remote_write URL (e.g. Mimir)"
+	}
+	argument "endpoint_basic_auth_username" {
+		comment = "Basic-auth username for the remote_write endpoint"
+	}
+	argument "endpoint_basic_auth_password" {
+		comment = "Basic-auth password for the remote_write endpoint"
+	}
+
+	// -- Optional -----------------------------------------------------------
+	argument "node_name" {
+		comment  = "Node name for the instance/node labels and the local-node filter (default: sys.env(\"K8S_NODE_NAME\"), injected by the Alloy Helm chart)"
+		optional = true
+	}
+	// Ports are strings so they can be concatenated straight into the
+	// __address__ replacement below without a formatting function.
+	argument "controller_manager_port" {
+		comment  = "kube-controller-manager secure port (default: \"10257\")"
+		optional = true
+		default  = "10257"
+	}
+	argument "scheduler_port" {
+		comment  = "kube-scheduler secure port (default: \"10259\")"
+		optional = true
+		default  = "10259"
+	}
+	argument "insecure_skip_verify" {
+		comment  = "Skip verification of the components' serving certificates (default: true). kubeadm gives both self-signed certs that the cluster CA does not validate, which is why kube-prometheus-stack also defaults to true."
+		optional = true
+		default  = true
+	}
+	argument "region" {
+		comment  = "Value for the region external label (default: \"\", unset)"
+		optional = true
+	}
+	argument "zone" {
+		comment  = "Value for the zone external label (default: \"\", unset)"
+		optional = true
+	}
+	argument "cluster_name" {
+		comment  = "Value for the cluster_name external label (default: \"\", unset)"
+		optional = true
+	}
+
+	discovery.kubernetes "nodes" {
+		role = "node"
+	}
+
+	discovery.relabel "local_control_plane" {
+		targets = discovery.kubernetes.nodes.targets
+
+		// Every DaemonSet pod discovers every node, so drop all but our own.
+		rule {
+			source_labels = ["__meta_kubernetes_node_name"]
+			regex         = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"))
+			action        = "keep"
+		}
+
+		// Control-plane nodes only. labelpresent_ is used rather than the
+		// label itself because node-role.kubernetes.io/control-plane carries
+		// an empty value, which a regex on the value cannot match reliably.
+		// On a worker this leaves zero targets and the scrapes below no-op.
+		rule {
+			source_labels = ["__meta_kubernetes_node_labelpresent_node_role_kubernetes_io_control_plane"]
+			regex         = "true"
+			action        = "keep"
+		}
+
+		rule {
+			target_label = "instance"
+			replacement  = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"))
+		}
+		rule {
+			target_label = "node"
+			replacement  = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"))
+		}
+	}
+
+	// role = "node" addresses the kubelet port, so rewrite __address__ to the
+	// node's InternalIP on each component's own secure port.
+	discovery.relabel "controller_manager" {
+		targets = discovery.relabel.local_control_plane.output
+
+		rule {
+			source_labels = ["__meta_kubernetes_node_address_InternalIP"]
+			regex         = "(.+)"
+			replacement   = "$1:" + argument.controller_manager_port.value
+			target_label  = "__address__"
+			action        = "replace"
+		}
+	}
+
+	discovery.relabel "scheduler" {
+		targets = discovery.relabel.local_control_plane.output
+
+		rule {
+			source_labels = ["__meta_kubernetes_node_address_InternalIP"]
+			regex         = "(.+)"
+			replacement   = "$1:" + argument.scheduler_port.value
+			target_label  = "__address__"
+			action        = "replace"
+		}
+	}
+
+	prometheus.scrape "controller_manager" {
+		targets    = discovery.relabel.controller_manager.output
+		forward_to = [prometheus.remote_write.default.receiver]
+
+		job_name = "kube-controller-manager"
+		scheme   = "https"
+
+		bearer_token_file = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+
+		tls_config {
+			ca_file              = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+			insecure_skip_verify = argument.insecure_skip_verify.value
+		}
+
+		scrape_interval = "30s"
+		scrape_timeout  = "10s"
+
+		// Local node only — do not distribute across the cluster.
+		clustering {
+			enabled = false
+		}
+	}
+
+	prometheus.scrape "scheduler" {
+		targets    = discovery.relabel.scheduler.output
+		forward_to = [prometheus.remote_write.default.receiver]
+
+		job_name = "kube-scheduler"
+		scheme   = "https"
+
+		bearer_token_file = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+
+		tls_config {
+			ca_file              = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+			insecure_skip_verify = argument.insecure_skip_verify.value
+		}
+
+		scrape_interval = "30s"
+		scrape_timeout  = "10s"
+
+		clustering {
+			enabled = false
+		}
+	}
+
+	prometheus.remote_write "default" {
+		endpoint {
+			url = argument.endpoint_url.value
+
+			basic_auth {
+				username = argument.endpoint_basic_auth_username.value
+				password = argument.endpoint_basic_auth_password.value
+			}
+
+			headers = {
+				"X-Scope-OrgID" = argument.tenant_id.value,
+			}
+		}
+
+		external_labels = {
+			region       = coalesce(argument.region.value, ""),
+			zone         = coalesce(argument.zone.value, ""),
+			cluster_name = coalesce(argument.cluster_name.value, ""),
+		}
+	}
+}
