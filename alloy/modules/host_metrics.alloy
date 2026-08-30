@@ -137,3 +137,273 @@ declare "unix" {
 		}
 	}
 }
+
+// kubelet
+//
+// Scrape the LOCAL node's kubelet directly (:10250) for its four metric
+// endpoints — /metrics, /metrics/cadvisor, /metrics/probes and
+// /metrics/resource — and remote-write them under a single tenant.
+//
+// Why not a ServiceMonitor: prometheus.operator.servicemonitors rejects
+// kube-prometheus-stack's kubelet ServiceMonitor, which hardcodes
+// bearerTokenFile and tlsConfig.caFile, because allow_arbitrary_file_access
+// defaults to false. That guard exists so a ServiceMonitor author cannot make
+// the collector read its own service account token and post it to a target
+// they control. It does not apply to a hand-written scrape config like this
+// one, so scraping natively fixes kubelet without weakening the guard for
+// ServiceMonitors that genuinely come from CRDs.
+//
+// Node-scoped and single-tenant, like unix above: each DaemonSet pod keeps
+// only its own node's target and clustering is disabled, so kubelet series are
+// not scattered across peers and instance=node stays one-to-one.
+//
+// Label shape deliberately matches what prometheus-operator produced, so
+// existing dashboards and alerts keep working: job="kubelet" on all four
+// endpoints, distinguished by an explicit metrics_path label.
+//
+// Requirements:
+//   - RBAC: get/list/watch on nodes and nodes/metrics. The Alloy Helm chart
+//     grants both by default via rbac.clusterRules.
+//   - K8S_NODE_NAME exposed to the collector (the Grafana Alloy Helm chart
+//     injects this automatically from spec.nodeName); or pass node_name.
+//
+// Usage:
+//   host_metrics.kubelet "kubelet" {
+//       tenant_id                    = "my-tenant"
+//       endpoint_url                 = sys.env("MIMIR_ENDPOINT_URL")
+//       endpoint_basic_auth_username = sys.env("AUTH_BASIC_USERNAME")
+//       endpoint_basic_auth_password = sys.env("AUTH_BASIC_PASSWORD")
+//       region                       = sys.env("REGION")
+//       zone                         = sys.env("ZONE")
+//       cluster_name                 = sys.env("CLUSTER_NAME")
+//   }
+declare "kubelet" {
+	// -- Required -----------------------------------------------------------
+	argument "tenant_id" {
+		comment = "The tenant (X-Scope-OrgID) to write kubelet metrics to"
+	}
+	argument "endpoint_url" {
+		comment = "Prometheus-compatible remote_write URL (e.g. Mimir)"
+	}
+	argument "endpoint_basic_auth_username" {
+		comment = "Basic-auth username for the remote_write endpoint"
+	}
+	argument "endpoint_basic_auth_password" {
+		comment = "Basic-auth password for the remote_write endpoint"
+	}
+
+	// -- Optional -----------------------------------------------------------
+	argument "node_name" {
+		comment  = "Node name for the instance/node labels and the local-node filter (default: sys.env(\"K8S_NODE_NAME\"), injected by the Alloy Helm chart)"
+		optional = true
+	}
+	// Uses default rather than coalesce() at the use site: false is a zero
+	// value to coalesce, so coalesce(argument..., true) would silently ignore
+	// an explicit false and always skip verification.
+	argument "insecure_skip_verify" {
+		comment  = "Skip verification of the kubelet serving certificate (default: true). The kubelet self-signs unless the cluster runs with serverTLSBootstrap, so the service account CA does not validate it — this is why kube-prometheus-stack also defaults to true. Set false only where kubelet certs are signed by the cluster CA."
+		optional = true
+		default  = true
+	}
+	argument "region" {
+		comment  = "Value for the region external label (default: \"\", unset)"
+		optional = true
+	}
+	argument "zone" {
+		comment  = "Value for the zone external label (default: \"\", unset)"
+		optional = true
+	}
+	argument "cluster_name" {
+		comment  = "Value for the cluster_name external label (default: \"\", unset)"
+		optional = true
+	}
+
+	// role = "node" sets __address__ to the node's address on the kubelet port
+	// (10250), which is exactly what we want to scrape.
+	discovery.kubernetes "nodes" {
+		role = "node"
+	}
+
+	discovery.relabel "node" {
+		targets = discovery.kubernetes.nodes.targets
+
+		// Every DaemonSet pod discovers every node, so drop all but our own.
+		// Without this, each node's kubelet would be scraped once per node in
+		// the cluster.
+		rule {
+			source_labels = ["__meta_kubernetes_node_name"]
+			regex         = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"))
+			action        = "keep"
+		}
+
+		rule {
+			target_label = "instance"
+			replacement  = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"))
+		}
+		rule {
+			target_label = "node"
+			replacement  = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"))
+		}
+	}
+
+	// One relabel per endpoint, solely to materialise the metrics_path label.
+	// Prometheus discards __metrics_path__ (double-underscore labels never
+	// survive relabeling), so the dashboards' metrics_path selector needs it
+	// set as a real label here.
+	discovery.relabel "kubelet" {
+		targets = discovery.relabel.node.output
+
+		rule {
+			target_label = "metrics_path"
+			replacement  = "/metrics"
+		}
+	}
+
+	discovery.relabel "cadvisor" {
+		targets = discovery.relabel.node.output
+
+		rule {
+			target_label = "metrics_path"
+			replacement  = "/metrics/cadvisor"
+		}
+	}
+
+	discovery.relabel "probes" {
+		targets = discovery.relabel.node.output
+
+		rule {
+			target_label = "metrics_path"
+			replacement  = "/metrics/probes"
+		}
+	}
+
+	discovery.relabel "resource" {
+		targets = discovery.relabel.node.output
+
+		rule {
+			target_label = "metrics_path"
+			replacement  = "/metrics/resource"
+		}
+	}
+
+	prometheus.scrape "kubelet" {
+		targets    = discovery.relabel.kubelet.output
+		forward_to = [prometheus.remote_write.default.receiver]
+
+		job_name     = "kubelet"
+		metrics_path = "/metrics"
+		scheme       = "https"
+
+		// honor_labels so cAdvisor's own namespace/pod/container labels win
+		// over anything the target carries, matching prometheus-operator.
+		honor_labels = true
+
+		bearer_token_file = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+
+		tls_config {
+			ca_file              = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+			insecure_skip_verify = argument.insecure_skip_verify.value
+		}
+
+		scrape_interval = "30s"
+		scrape_timeout  = "10s"
+
+		// Local node only — do not distribute across the cluster.
+		clustering {
+			enabled = false
+		}
+	}
+
+	prometheus.scrape "cadvisor" {
+		targets    = discovery.relabel.cadvisor.output
+		forward_to = [prometheus.remote_write.default.receiver]
+
+		job_name     = "kubelet"
+		metrics_path = "/metrics/cadvisor"
+		scheme       = "https"
+		honor_labels = true
+
+		bearer_token_file = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+
+		tls_config {
+			ca_file              = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+			insecure_skip_verify = argument.insecure_skip_verify.value
+		}
+
+		scrape_interval = "30s"
+		scrape_timeout  = "10s"
+
+		clustering {
+			enabled = false
+		}
+	}
+
+	prometheus.scrape "probes" {
+		targets    = discovery.relabel.probes.output
+		forward_to = [prometheus.remote_write.default.receiver]
+
+		job_name     = "kubelet"
+		metrics_path = "/metrics/probes"
+		scheme       = "https"
+		honor_labels = true
+
+		bearer_token_file = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+
+		tls_config {
+			ca_file              = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+			insecure_skip_verify = argument.insecure_skip_verify.value
+		}
+
+		scrape_interval = "30s"
+		scrape_timeout  = "10s"
+
+		clustering {
+			enabled = false
+		}
+	}
+
+	prometheus.scrape "resource" {
+		targets    = discovery.relabel.resource.output
+		forward_to = [prometheus.remote_write.default.receiver]
+
+		job_name     = "kubelet"
+		metrics_path = "/metrics/resource"
+		scheme       = "https"
+		honor_labels = true
+
+		bearer_token_file = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+
+		tls_config {
+			ca_file              = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+			insecure_skip_verify = argument.insecure_skip_verify.value
+		}
+
+		scrape_interval = "30s"
+		scrape_timeout  = "10s"
+
+		clustering {
+			enabled = false
+		}
+	}
+
+	prometheus.remote_write "default" {
+		endpoint {
+			url = argument.endpoint_url.value
+
+			basic_auth {
+				username = argument.endpoint_basic_auth_username.value
+				password = argument.endpoint_basic_auth_password.value
+			}
+
+			headers = {
+				"X-Scope-OrgID" = argument.tenant_id.value,
+			}
+		}
+
+		external_labels = {
+			region       = coalesce(argument.region.value, ""),
+			zone         = coalesce(argument.zone.value, ""),
+			cluster_name = coalesce(argument.cluster_name.value, ""),
+		}
+	}
+}
