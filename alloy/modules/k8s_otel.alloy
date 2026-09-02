@@ -304,6 +304,22 @@ declare "tenant_route" {
 		comment  = "Explicit latency histogram bucket boundaries for this tenant's spanmetrics duration metric (default: [\"100ms\", \"250ms\", \"500ms\", \"1s\", \"2.5s\", \"5s\", \"10s\"])"
 		optional = true
 	}
+	// Both use `default` rather than coalesce() at the use site: 0 and "0s" are
+	// the components' "unlimited"/"never" sentinels AND zero values to
+	// coalesce, so coalesce(argument..., 10000) would silently rewrite an
+	// explicit 0 back to the default -- same trap as insecure_skip_verify in
+	// host_metrics. Passing 0 / "0s" here is therefore honoured, and restores
+	// the unbounded upstream behaviour deliberately.
+	argument "spanmetrics_cardinality_limit" {
+		comment  = "Max unique dimension combinations this tenant's spanmetrics tracks; excess is folded into one otel.metric.overflow=\"true\" series (default: 10000). 0 means UNLIMITED -- do not use under a DaemonSet."
+		optional = true
+		default  = 10000
+	}
+	argument "spanmetrics_metrics_expiration" {
+		comment  = "Evict a spanmetrics series whose span has not been seen for this long (default: \"5m\"). \"0s\" means never evict, which lets the aggregation map grow without bound."
+		optional = true
+		default  = "5m"
+	}
 
 	// Enriched logs/metrics/traces enter here; the gateway forwards to these.
 	export "logs_input" {
@@ -386,6 +402,31 @@ declare "tenant_route" {
 		// Flush the accumulated metrics periodically so counters/histograms are
 		// emitted on a fixed cadence rather than only when spans arrive.
 		metrics_flush_interval = "15s"
+
+		// MEMORY GUARDRAILS. Upstream defaults are aggregation_cardinality_limit
+		// = 0 (unlimited) and metrics_expiration = "0s" (never evict); with the
+		// default CUMULATIVE temporality, flushing emits values but does NOT
+		// drop keys. So out of the box this map only ever grows -- every unique
+		// (service.name, span.name, span.kind, status.code, http.request.method,
+		// http.route, http.response.status_code) tuple pins a counter and a
+		// 7-bucket histogram for the process's lifetime.
+		//
+		// That is the module's single largest memory risk, and it is worst
+		// exactly where this module is usually deployed: under a DaemonSet each
+		// node runs its own copy of every tenant_route, so the map is NOT
+		// sharded -- each pod accumulates independently toward near-global
+		// cardinality. A mesh source (Istio ingress/sidecars) makes it acute,
+		// since http.route is only low-cardinality when the emitter sets a
+		// TEMPLATED route; a raw path turns every distinct URL into a permanent
+		// entry.
+		//
+		// The limit degrades gracefully: past it, additional combinations are
+		// folded into a single otel.metric.overflow="true" series rather than
+		// being dropped silently, so overflow is visible in the data. Expiry
+		// resets a returning series' cumulative counter, which rate()/increase()
+		// already handle as a normal counter reset.
+		aggregation_cardinality_limit = argument.spanmetrics_cardinality_limit.value
+		metrics_expiration            = argument.spanmetrics_metrics_expiration.value
 
 		dimension {
 			name = "http.request.method"
