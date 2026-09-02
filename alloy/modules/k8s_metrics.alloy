@@ -197,3 +197,277 @@ declare "kubernetes" {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Split discovery: k8s_metrics.crds + k8s_metrics.annotations
+//
+// k8s_metrics.kubernetes above runs BOTH discovery paths against the same
+// namespaces and forwards both to one remote_write. Nothing de-duplicates
+// between them, so any workload that ships a ServiceMonitor/PodMonitor AND
+// carries prometheus.io/scrape: "true" is scraped TWICE -- once per path,
+// landing as two distinct series that differ only in the job label. That is
+// not a sample collision, it is doubled cardinality plus silent double-
+// counting in any panel that aggregates without a job filter.
+//
+// It is common. The gitlab-runner chart stamps the annotation from the same
+// metrics.enabled that gates its ServiceMonitor, so you cannot have one
+// without the other; the GitLab chart annotates gitaly, gitlab-exporter,
+// gitlab-pages, gitlab-shell, kas, praefect, sidekiq and webservice the same
+// way.
+//
+// Alloy cannot conditionally skip a component, so -- exactly as with the two
+// k8s_alert declares -- "skip a discovery path" means "do not instantiate that
+// declare". These two split k8s_metrics.kubernetes along that seam:
+//
+//   k8s_metrics.crds        -- ServiceMonitor + PodMonitor CRDs only
+//   k8s_metrics.annotations -- prometheus.io/scrape annotated pods only
+//
+// Instantiate per namespace group according to what actually publishes there.
+// Operator-managed workloads (GitLab, the runner, most Bitnami charts) need
+// only .crds. Workloads with no CRDs -- Istio sidecars and gateways, which are
+// discovered by annotation on :15020 -- need only .annotations. Pointing both
+// at one namespace reproduces the double scrape on purpose, so do that only
+// where the two paths are known to cover disjoint targets.
+//
+// k8s_metrics.kubernetes is unchanged and still runs both. It remains correct
+// for a namespace where nothing is doubly covered, and existing callers need
+// no migration.
+//
+// Usage:
+//   k8s_metrics.crds "infra" {
+//       namespaces                   = ["gitlab", "gitlab-runner"]
+//       tenant_id                    = "my-tenant"
+//       endpoint_url                 = sys.env("MIMIR_ENDPOINT_URL")
+//       endpoint_basic_auth_username = sys.env("AUTH_BASIC_USERNAME")
+//       endpoint_basic_auth_password = sys.env("AUTH_BASIC_PASSWORD")
+//   }
+//   k8s_metrics.annotations "mesh" {
+//       namespaces                   = ["istio-system", "istio-ingress"]
+//       tenant_id                    = "my-tenant"
+//       endpoint_url                 = sys.env("MIMIR_ENDPOINT_URL")
+//       endpoint_basic_auth_username = sys.env("AUTH_BASIC_USERNAME")
+//       endpoint_basic_auth_password = sys.env("AUTH_BASIC_PASSWORD")
+//   }
+// ---------------------------------------------------------------------------
+
+// k8s_metrics.crds -- ServiceMonitor + PodMonitor CRDs only.
+declare "crds" {
+	// -- Required -----------------------------------------------------------
+	argument "namespaces" {
+		comment = "The namespaces to look for ServiceMonitor/PodMonitor CRDs in"
+	}
+	argument "tenant_id" {
+		comment = "The tenant (X-Scope-OrgID) to write metrics to"
+	}
+	argument "endpoint_url" {
+		comment = "Prometheus-compatible remote_write URL (e.g. Mimir)"
+	}
+	argument "endpoint_basic_auth_username" {
+		comment = "Basic-auth username for the remote_write endpoint"
+	}
+	argument "endpoint_basic_auth_password" {
+		comment = "Basic-auth password for the remote_write endpoint"
+	}
+
+	// -- Optional -----------------------------------------------------------
+	// No project_label here: it is applied by the annotated-pod relabel rules,
+	// which this declare does not run. CRD targets carry whatever labels the
+	// ServiceMonitor/PodMonitor author configured.
+	argument "region" {
+		comment  = "Value for the region external label (default: \"\", unset)"
+		optional = true
+	}
+	argument "zone" {
+		comment  = "Value for the zone external label (default: \"\", unset)"
+		optional = true
+	}
+	argument "cluster_name" {
+		comment  = "Value for the cluster_name external label (default: \"\", unset)"
+		optional = true
+	}
+
+	// Scrape ServiceMonitor CRDs scoped to this tenant's namespaces.
+	prometheus.operator.servicemonitors "sm" {
+		forward_to = [prometheus.remote_write.default.receiver]
+		namespaces = argument.namespaces.value
+
+		// Split ServiceMonitor targets across the Alloy cluster.
+		clustering {
+			enabled = true
+		}
+	}
+
+	// Scrape Prometheus-Operator PodMonitor CRDs scoped to this tenant's namespaces.
+	prometheus.operator.podmonitors "pm" {
+		forward_to = [prometheus.remote_write.default.receiver]
+		namespaces = argument.namespaces.value
+
+		// Split PodMonitor targets across the Alloy cluster.
+		clustering {
+			enabled = true
+		}
+	}
+
+	prometheus.remote_write "default" {
+		endpoint {
+			url = argument.endpoint_url.value
+
+			basic_auth {
+				username = argument.endpoint_basic_auth_username.value
+				password = argument.endpoint_basic_auth_password.value
+			}
+
+			headers = {
+				"X-Scope-OrgID" = argument.tenant_id.value,
+			}
+		}
+
+		external_labels = {
+			region       = coalesce(argument.region.value, ""),
+			zone         = coalesce(argument.zone.value, ""),
+			cluster_name = coalesce(argument.cluster_name.value, ""),
+		}
+	}
+}
+
+// k8s_metrics.annotations -- prometheus.io/scrape annotated pods only.
+declare "annotations" {
+	// -- Required -----------------------------------------------------------
+	argument "namespaces" {
+		comment = "The namespaces to look for annotated pods in"
+	}
+	argument "tenant_id" {
+		comment = "The tenant (X-Scope-OrgID) to write metrics to"
+	}
+	argument "endpoint_url" {
+		comment = "Prometheus-compatible remote_write URL (e.g. Mimir)"
+	}
+	argument "endpoint_basic_auth_username" {
+		comment = "Basic-auth username for the remote_write endpoint"
+	}
+	argument "endpoint_basic_auth_password" {
+		comment = "Basic-auth password for the remote_write endpoint"
+	}
+
+	// -- Optional -----------------------------------------------------------
+	argument "project_label" {
+		comment  = "Pod meta-label to map to a project_name label, e.g. \"__meta_kubernetes_pod_label_app_kubernetes_io_part_of\". Empty disables it (default: \"\")"
+		optional = true
+	}
+	argument "region" {
+		comment  = "Value for the region external label (default: \"\", unset)"
+		optional = true
+	}
+	argument "zone" {
+		comment  = "Value for the zone external label (default: \"\", unset)"
+		optional = true
+	}
+	argument "cluster_name" {
+		comment  = "Value for the cluster_name external label (default: \"\", unset)"
+		optional = true
+	}
+
+	discovery.kubernetes "pods" {
+		role = "pod"
+		namespaces {
+			names = argument.namespaces.value
+		}
+	}
+
+	discovery.relabel "pods" {
+		targets = discovery.kubernetes.pods.targets
+
+		// Only scrape pods explicitly opted in via annotation.
+		rule {
+			source_labels = ["__meta_kubernetes_pod_annotation_prometheus_io_scrape"]
+			regex         = "true"
+			action        = "keep"
+		}
+
+		// Honour a custom metrics path annotation.
+		rule {
+			source_labels = ["__meta_kubernetes_pod_annotation_prometheus_io_path"]
+			regex         = "(.+)"
+			target_label  = "__metrics_path__"
+			action        = "replace"
+		}
+
+		// Honour a custom scrape port annotation.
+		rule {
+			source_labels = ["__address__", "__meta_kubernetes_pod_annotation_prometheus_io_port"]
+			regex         = "([^:]+)(?::\\d+)?;(\\d+)"
+			replacement   = "$1:$2"
+			target_label  = "__address__"
+			action        = "replace"
+		}
+
+		// Honour a custom scheme annotation (http/https).
+		rule {
+			source_labels = ["__meta_kubernetes_pod_annotation_prometheus_io_scheme"]
+			regex         = "(https?)"
+			target_label  = "__scheme__"
+			action        = "replace"
+		}
+
+		// Standard identifying labels.
+		rule {
+			source_labels = ["__meta_kubernetes_namespace"]
+			target_label  = "namespace"
+		}
+		rule {
+			source_labels = ["__meta_kubernetes_pod_name"]
+			target_label  = "pod"
+		}
+		rule {
+			source_labels = ["__meta_kubernetes_pod_container_name"]
+			target_label  = "container"
+		}
+		rule {
+			source_labels = ["__meta_kubernetes_pod_node_name"]
+			target_label  = "node"
+		}
+
+		// Optional: promote a site-specific pod meta-label to project_name.
+		// Defaults to a meta-label that never exists, so the label stays unset
+		// unless a caller passes project_label.
+		rule {
+			source_labels = [coalesce(argument.project_label.value, "__meta_kubernetes_pod_label_k8s_metrics_unset")]
+			action        = "replace"
+			target_label  = "project_name"
+		}
+	}
+
+	prometheus.scrape "pods" {
+		targets    = discovery.relabel.pods.output
+		forward_to = [prometheus.remote_write.default.receiver]
+
+		scrape_interval = "30s"
+		scrape_timeout  = "10s"
+
+		// Split annotated-pod targets across the Alloy cluster.
+		clustering {
+			enabled = true
+		}
+	}
+
+	prometheus.remote_write "default" {
+		endpoint {
+			url = argument.endpoint_url.value
+
+			basic_auth {
+				username = argument.endpoint_basic_auth_username.value
+				password = argument.endpoint_basic_auth_password.value
+			}
+
+			headers = {
+				"X-Scope-OrgID" = argument.tenant_id.value,
+			}
+		}
+
+		external_labels = {
+			region       = coalesce(argument.region.value, ""),
+			zone         = coalesce(argument.zone.value, ""),
+			cluster_name = coalesce(argument.cluster_name.value, ""),
+		}
+	}
+}
