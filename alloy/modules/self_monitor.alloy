@@ -79,6 +79,15 @@ declare "default" {
 		comment  = "Value for the zone external label on metrics, and a static label on logs (default: \"\", unset)"
 		optional = true
 	}
+	// Uses `default` rather than relying on coalesce alone at the use site for
+	// the same reason as elsewhere in these modules -- but the use site ALSO
+	// coalesces, because an unset argument and an unknown key fail differently
+	// and both have to land on "ship everything". See the stage.drop comment.
+	argument "logs_min_level" {
+		comment  = "Lowest self-log level shipped to Loki: \"debug\" (default, ship everything), \"info\", \"warn\" or \"error\". The top-level logging block's `level` gates stderr AND write_to together, so pair logging.level = \"info\" with logs_min_level = \"warn\" to keep info in kubectl logs while shipping only warn+. This only ever NARROWS: a level the logging block never emits cannot appear here."
+		optional = true
+		default  = "debug"
+	}
 
 	// ----- Metrics: fully self-contained -------------------------------------
 	// Self-internal metrics (loki_process_dropped_lines_total, remote_write
@@ -122,6 +131,43 @@ declare "default" {
 	// would churn Loki streams while providing little selector value.
 	loki.process "alloy" {
 		forward_to = [loki.write.alloy.receiver]
+
+		// Level filter. The top-level `logging` block's own `level` gates
+		// stderr AND write_to together, so it cannot express "info visible in
+		// kubectl logs, warn+ shipped to Loki" -- that split has to happen
+		// here. write_to attaches no level label; the level exists only as a
+		// field inside the line, so parse it back out. Requires the caller to
+		// set logging.format = "logfmt" (the default in our configs).
+		stage.logfmt {
+			mapping = { "level" = "level" }
+		}
+
+		// The map turns "lowest level to keep" into "levels below it".
+		//
+		// The coalesce is load-bearing, not defensive noise. An unknown key --
+		// a typo like "warning", or a caller on an older chart passing
+		// something else -- yields an EMPTY expression, and an empty RE2
+		// matches EVERY line, silently dropping all self-logs in the one
+		// pipeline whose job is reporting that the collector is broken. Alloy
+		// does not reject the bad key: `alloy validate` exits 0 on it, and a
+		// runtime A/B confirmed the failure is total and silent (bad key
+		// forwarded 0 of 23 entries; with this coalesce it forwarded all of
+		// them). Falling back to a never-matching pattern makes a typo fail
+		// OPEN -- noisy rather than blind.
+		//
+		// Same reasoning covers unparseable input: a non-logfmt line, or one
+		// with no level field, extracts "" which matches none of these
+		// patterns and is kept.
+		stage.drop {
+			source = "level"
+			expression = coalesce({
+				"debug" = "^\\x00$",
+				"info"  = "^(debug)$",
+				"warn"  = "^(debug|info)$",
+				"error" = "^(debug|info|warn)$",
+			}[coalesce(argument.logs_min_level.value, "debug")], "^\\x00$")
+			drop_counter_reason = "self_log_below_min_level"
+		}
 
 		stage.static_labels {
 			values = {
