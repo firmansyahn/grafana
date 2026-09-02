@@ -20,7 +20,9 @@
 //
 // Requirements:
 //   - Host /, /proc and /sys mounted read-only into the collector at
-//     /host/root, /host/proc and /host/sys respectively.
+//     /host/root, /host/proc and /host/sys respectively. The root mount needs
+//     mountPropagation: HostToContainer so the host's /run tmpfs is visible
+//     underneath it — the diskstats collector reads udev data from there.
 //   - K8S_NODE_NAME exposed to the collector (the Grafana Alloy Helm chart
 //     injects this automatically from spec.nodeName); or pass node_name.
 //
@@ -69,9 +71,18 @@ declare "unix" {
 
 	prometheus.exporter.unix "node" {
 		rootfs_path = "/host/root"
-	    udev_data_path = "/host/run/udev/data"
 		procfs_path = "/host/proc"
 		sysfs_path  = "/host/sys"
+
+		// Relative to rootfs_path, NOT an independent mount: the host's /run is
+		// a tmpfs reached through the / mount at /host/root, so this must be
+		// /host/root/run/... — matching upstream prometheus-node-exporter's
+		// --path.udev.data. Pointing it at /host/run/... makes diskstats log
+		// "Failed to open directory, disabling udev device properties" on every
+		// scrape and drops node_disk_info's model/serial/revision labels.
+		// Requires mountPropagation: HostToContainer on the root mount, or the
+		// tmpfs is not visible underneath it.
+		udev_data_path = "/host/root/run/udev/data"
 
 		// The xfs collector fails to parse /proc/fs/xfs/stat on some kernels
 		// ("xpc" line is not a uint), erroring on every scrape. It yields no
