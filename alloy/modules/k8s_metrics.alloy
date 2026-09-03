@@ -19,16 +19,19 @@
 //     project_name label (site-specific; disabled by default).
 //   - Stamps region / zone / cluster_name external labels.
 //   - Embedded remote_write so the tenant (X-Scope-OrgID) is set per instance.
-//   - Optional kubernetes_role to discover ServiceMonitor targets through
-//     EndpointSlices instead of the legacy Endpoints API -- required for a
-//     ServiceMonitor over a selectorless Service (external VM targets), which
-//     otherwise resolves to zero targets without reporting anything.
+//   - Discovers ServiceMonitor targets through EndpointSlices by default
+//     (kubernetes_role). The legacy Endpoints role cannot see a ServiceMonitor
+//     over a selectorless Service -- external VM targets published as a
+//     hand-maintained EndpointSlice -- and resolves it to zero targets without
+//     reporting anything.
 //
 // Requirements:
 //   - RBAC: get/list/watch on pods, services, endpoints, endpointslices and the
-//     monitoring ServiceMonitor CRD. (endpointslices is only read when
-//     kubernetes_role = "endpointslice"; the Alloy Helm chart's default rules
-//     already grant it.)
+//     monitoring ServiceMonitor CRD. endpointslices is REQUIRED on the default
+//     path since kubernetes_role defaults to "endpointslice" -- the Alloy Helm
+//     chart's default rules already grant it, but a hand-written ClusterRole
+//     carried over from an older deployment may not, and discovery then fails
+//     for every ServiceMonitor rather than just the external ones.
 //
 // Usage:
 //   k8s_metrics.kubernetes "my_tenant" {
@@ -77,9 +80,9 @@ declare "kubernetes" {
 		optional = true
 	}
 	argument "kubernetes_role" {
-		comment  = "Service discovery role for ServiceMonitors: \"endpoints\" (default) or \"endpointslice\". Use endpointslice when a ServiceMonitor selects a SELECTORLESS Service -- external targets published as a hand-maintained EndpointSlice. Such a Service has no Endpoints object (mirroring only runs Endpoints -> EndpointSlice, never the reverse), so under the default role the ServiceMonitor is discovered and resolves to ZERO targets: no error, no `up` series, nothing to notice. Requires Alloy v1.6.0+."
+		comment  = "Service discovery role for ServiceMonitors: \"endpointslice\" (default) or \"endpoints\". Endpointslice is the safe default: every Service with endpoints has EndpointSlices, whether the endpoint controller built them or a human did, so it resolves everything the legacy role does AND selectorless Services whose targets are external VMs published as a hand-maintained EndpointSlice. Those have no Endpoints object at all -- mirroring only runs Endpoints -> EndpointSlice, never the reverse -- so under \"endpoints\" such a ServiceMonitor is discovered and resolves to ZERO targets: no error, no `up` series, nothing to notice. Override to \"endpoints\" only to work around a cluster that cannot grant endpointslices RBAC. Requires Alloy v1.6.0+."
 		optional = true
-		default  = "endpoints"
+		default  = "endpointslice"
 	}
 
 	// Scrape ServiceMonitor CRDs scoped to this tenant's namespaces.
@@ -252,11 +255,11 @@ declare "kubernetes" {
 //       endpoint_url                 = sys.env("MIMIR_ENDPOINT_URL")
 //       endpoint_basic_auth_username = sys.env("AUTH_BASIC_USERNAME")
 //       endpoint_basic_auth_password = sys.env("AUTH_BASIC_PASSWORD")
-//       // Needed only when a ServiceMonitor here selects a SELECTORLESS
-//       // Service -- external VMs published as a hand-maintained
-//       // EndpointSlice. Safe for ordinary pod-backed Services too: they have
-//       // both objects, so either role resolves them.
-//       kubernetes_role              = "endpointslice"
+//       // kubernetes_role defaults to "endpointslice" and rarely needs
+//       // setting. Pass "endpoints" only if this cluster cannot grant Alloy
+//       // endpointslices RBAC -- and then any ServiceMonitor over a
+//       // selectorless Service in these namespaces will silently yield no
+//       // targets.
 //   }
 //   k8s_metrics.annotations "mesh" {
 //       namespaces                   = ["istio-system", "istio-ingress"]
@@ -303,9 +306,9 @@ declare "crds" {
 		optional = true
 	}
 	argument "kubernetes_role" {
-		comment  = "Service discovery role for ServiceMonitors: \"endpoints\" (default) or \"endpointslice\". Use endpointslice when a ServiceMonitor selects a SELECTORLESS Service -- external targets published as a hand-maintained EndpointSlice. Such a Service has no Endpoints object (mirroring only runs Endpoints -> EndpointSlice, never the reverse), so under the default role the ServiceMonitor is discovered and resolves to ZERO targets: no error, no `up` series, nothing to notice. Requires Alloy v1.6.0+."
+		comment  = "Service discovery role for ServiceMonitors: \"endpointslice\" (default) or \"endpoints\". Endpointslice is the safe default: every Service with endpoints has EndpointSlices, whether the endpoint controller built them or a human did, so it resolves everything the legacy role does AND selectorless Services whose targets are external VMs published as a hand-maintained EndpointSlice. Those have no Endpoints object at all -- mirroring only runs Endpoints -> EndpointSlice, never the reverse -- so under \"endpoints\" such a ServiceMonitor is discovered and resolves to ZERO targets: no error, no `up` series, nothing to notice. Override to \"endpoints\" only to work around a cluster that cannot grant endpointslices RBAC. Requires Alloy v1.6.0+."
 		optional = true
-		default  = "endpoints"
+		default  = "endpointslice"
 	}
 
 	// Scrape ServiceMonitor CRDs scoped to this tenant's namespaces.
