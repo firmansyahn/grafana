@@ -1,0 +1,305 @@
+// container_metrics
+//
+// Per-tenant APPLICATION metrics from containers on a plain Docker or Podman
+// host: discover containers through the runtime's API, scrape the metrics
+// endpoint the app inside them exposes, and remote-write to a
+// Prometheus-compatible backend (e.g. Mimir) under a dedicated tenant.
+//
+// This is the plain-container counterpart to k8s_metrics.annotations. There
+// are no pods to annotate, so containers opt in with container LABELS, which
+// are set once at `docker run` / in the Compose file and cannot be changed on
+// a running container.
+//
+// This module does NOT measure containers. It only scrapes what the process
+// inside them chooses to export, so a container running plain Postgres or
+// nginx yields nothing here. For CPU, memory, block I/O and pids of EVERY
+// container, exporting or not, use host_metrics.containers, which reads the
+// kernel's cgroup accounting through cAdvisor. The two are complements and are
+// meant to run side by side: series from this module carry the same `name` and
+// 12-character `container_id` labels that host_metrics.containers sets, so
+// application metrics and resource metrics join on them.
+//
+// Opt-in labels (the label NAMES are configurable, the semantics are not):
+//   metrics.enable = "true"      required; nothing without it is scraped
+//   metrics.port   = "9187"      port to scrape on the container's address
+//   metrics.path   = "/metrics"  default "/metrics"
+//   metrics.scheme = "https"     default "http"
+//
+// Podman: discovery.docker speaks the Docker Engine API, and Podman's
+// compatibility socket answers it, so point docker_host at Podman's socket and
+// set runtime = "podman". That socket is NOT enabled by default:
+//     systemctl enable --now podman.socket          # rootful
+// creates /run/podman/podman.sock. Without it this module has no way to
+// discover anything -- unlike host_metrics.containers, which needs no socket
+// at all because it reads cgroups directly. Rootless Podman exposes its socket
+// under $XDG_RUNTIME_DIR/podman/podman.sock instead.
+//
+// Labels on every scraped series:
+//   name          container name, as `docker ps` / `podman ps` show it
+//   container_id  12-character short ID
+//   node          the host the container runs on
+//   runtime       "docker" or "podman", from the runtime argument
+//   instance      the container name, NOT an address -- see the comment on the
+//                 instance rule below
+//   compose_project / compose_service  when the Compose labels are present
+//
+// There is deliberately no `image` label: Docker service discovery does not
+// expose the image (it publishes only id, name, network mode, labels, network
+// and port metadata), so a rule for it would silently produce nothing.
+// host_metrics.containers reports the image for Docker containers.
+//
+// Requirements:
+//   - The runtime socket readable by Alloy: mount it read-only when Alloy runs
+//     in a container, and run as root or a member of the docker group. No
+//     privileged mode, host PID or cgroup namespace is needed -- this module
+//     only talks to an API and makes HTTP requests.
+//   - Network reachability from Alloy to each container's metrics port. With
+//     --network=host that is the host's own address; otherwise Alloy must share
+//     a network with the target containers.
+//
+// Usage (Docker):
+//   container_metrics.apps "my_tenant" {
+//       tenant_id                    = "my-tenant"
+//       endpoint_url                 = sys.env("MIMIR_ENDPOINT_URL")
+//       endpoint_basic_auth_username = sys.env("AUTH_BASIC_USERNAME")
+//       endpoint_basic_auth_password = sys.env("AUTH_BASIC_PASSWORD")
+//       node_name                    = sys.env("NODE_NAME")
+//       region                       = sys.env("REGION")
+//       cluster_name                 = sys.env("CLUSTER_NAME")
+//   }
+//
+// Usage (Podman):
+//   container_metrics.apps "my_tenant" {
+//       docker_host = "unix:///run/podman/podman.sock"
+//       runtime     = "podman"
+//       ...
+//   }
+declare "apps" {
+	// -- Required -----------------------------------------------------------
+	argument "tenant_id" {
+		comment = "The tenant (X-Scope-OrgID) to write container application metrics to"
+	}
+	argument "endpoint_url" {
+		comment = "Prometheus-compatible remote_write URL (e.g. Mimir)"
+	}
+	argument "endpoint_basic_auth_username" {
+		comment = "Basic-auth username for the remote_write endpoint"
+	}
+	argument "endpoint_basic_auth_password" {
+		comment = "Basic-auth password for the remote_write endpoint"
+	}
+
+	// -- Optional -----------------------------------------------------------
+	argument "docker_host" {
+		comment  = "Container runtime API endpoint (default: \"unix:///var/run/docker.sock\"). Podman: \"unix:///run/podman/podman.sock\", which requires podman.socket to be enabled."
+		optional = true
+		default  = "unix:///var/run/docker.sock"
+	}
+	argument "runtime" {
+		comment  = "Value for the runtime label: \"docker\" (default) or \"podman\". Discovery cannot tell them apart -- Podman answers the Docker API -- so this is declared by the caller, and it matches the label host_metrics.containers derives from the cgroup path."
+		optional = true
+		default  = "docker"
+	}
+	argument "node_name" {
+		comment  = "Value for the node label (default: sys.env(\"K8S_NODE_NAME\"), else the hostname)"
+		optional = true
+	}
+	argument "enable_label" {
+		comment  = "Container label that opts a container in, matched against \"true\" (default: \"metrics.enable\")"
+		optional = true
+		default  = "metrics.enable"
+	}
+	argument "port_label" {
+		comment  = "Container label holding the port to scrape (default: \"metrics.port\"). Without it the address discovery reports is used, which is only useful for containers that publish exactly one port."
+		optional = true
+		default  = "metrics.port"
+	}
+	argument "path_label" {
+		comment  = "Container label holding the metrics path (default: \"metrics.path\", falling back to /metrics)"
+		optional = true
+		default  = "metrics.path"
+	}
+	argument "scheme_label" {
+		comment  = "Container label holding the scheme, http or https (default: \"metrics.scheme\", falling back to http)"
+		optional = true
+		default  = "metrics.scheme"
+	}
+	argument "refresh_interval" {
+		comment  = "How often to re-list containers from the runtime API (default: \"30s\")"
+		optional = true
+		default  = "30s"
+	}
+	argument "scrape_interval" {
+		comment  = "Scrape interval for discovered containers (default: \"30s\")"
+		optional = true
+		default  = "30s"
+	}
+	argument "scrape_timeout" {
+		comment  = "Scrape timeout for discovered containers (default: \"10s\")"
+		optional = true
+		default  = "10s"
+	}
+	argument "job_name" {
+		comment  = "Value for the job label (default: \"containers\")"
+		optional = true
+		default  = "containers"
+	}
+	argument "region" {
+		comment  = "Value for the region external label (default: \"\", unset)"
+		optional = true
+	}
+	argument "zone" {
+		comment  = "Value for the zone external label (default: \"\", unset)"
+		optional = true
+	}
+	argument "cluster_name" {
+		comment  = "Value for the cluster_name external label (default: \"\", unset)"
+		optional = true
+	}
+	// Same contract as in host_metrics: replaces the default set rather than
+	// merging with it, since Alloy has no map-merge function.
+	argument "external_labels" {
+		comment  = "Complete external_labels map for the embedded remote_write, REPLACING the region/zone/cluster_name defaults (default: unset, which keeps them)"
+		optional = true
+	}
+
+	discovery.docker "containers" {
+		host             = argument.docker_host.value
+		refresh_interval = argument.refresh_interval.value
+	}
+
+	discovery.relabel "containers" {
+		targets = discovery.docker.containers.targets
+
+		// Container labels reach relabeling as
+		// __meta_docker_container_label_<name>, with every character that is
+		// illegal in a label name replaced by an underscore. So the
+		// caller-facing "metrics.enable" has to be folded to
+		// "metrics_enable" here; dashes get the same treatment.
+		rule {
+			source_labels = ["__meta_docker_container_label_" + string.replace(string.replace(string.to_lower(argument.enable_label.value), ".", "_"), "-", "_")]
+			regex         = "true"
+			action        = "keep"
+		}
+
+		// Port from the opt-in label. The address discovery reports already
+		// carries a port, so this rewrites it rather than appending.
+		rule {
+			source_labels = [
+				"__address__",
+				"__meta_docker_container_label_" + string.replace(string.replace(string.to_lower(argument.port_label.value), ".", "_"), "-", "_"),
+			]
+			regex        = "([^:]+)(?::\\d+)?;(\\d+)"
+			replacement  = "$1:$2"
+			target_label = "__address__"
+			action       = "replace"
+		}
+
+		// Path and scheme, each left at Prometheus's default when the label is
+		// absent (the rule simply does not match).
+		rule {
+			source_labels = ["__meta_docker_container_label_" + string.replace(string.replace(string.to_lower(argument.path_label.value), ".", "_"), "-", "_")]
+			regex         = "(.+)"
+			target_label  = "__metrics_path__"
+			action        = "replace"
+		}
+
+		rule {
+			source_labels = ["__meta_docker_container_label_" + string.replace(string.replace(string.to_lower(argument.scheme_label.value), ".", "_"), "-", "_")]
+			regex         = "(https?)"
+			target_label  = "__scheme__"
+			action        = "replace"
+		}
+
+		// Docker reports the name with a leading slash ("/patroni"); strip it
+		// so the value matches what `docker ps` prints AND what cAdvisor puts
+		// in host_metrics.containers' name label, which is what makes the two
+		// joinable.
+		rule {
+			source_labels = ["__meta_docker_container_name"]
+			regex         = "/?(.*)"
+			replacement   = "$1"
+			target_label  = "name"
+			action        = "replace"
+		}
+
+		// 12-character short ID, matching host_metrics.containers.
+		rule {
+			source_labels = ["__meta_docker_container_id"]
+			regex         = "([0-9a-f]{12})[0-9a-f]*"
+			replacement   = "$1"
+			target_label  = "container_id"
+			action        = "replace"
+		}
+
+		rule {
+			source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+			target_label  = "compose_project"
+			action        = "replace"
+		}
+
+		rule {
+			source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+			target_label  = "compose_service"
+			action        = "replace"
+		}
+
+		rule {
+			target_label = "node"
+			replacement  = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"), constants.hostname)
+		}
+
+		rule {
+			target_label = "runtime"
+			replacement  = argument.runtime.value
+		}
+
+		// instance is the container name, not the usual host:port. On a host
+		// where containers run with --network=host -- the normal case for this
+		// module, since Alloy has to reach them -- every container shares the
+		// host's address, so an address-derived instance would collapse all of
+		// them onto one series and make their `up` metrics overwrite each
+		// other. The name is unique per host, and node carries the host.
+		rule {
+			source_labels = ["name"]
+			target_label  = "instance"
+			action        = "replace"
+		}
+	}
+
+	prometheus.scrape "containers" {
+		targets    = discovery.relabel.containers.output
+		forward_to = [prometheus.remote_write.default.receiver]
+
+		job_name        = argument.job_name.value
+		scrape_interval = argument.scrape_interval.value
+		scrape_timeout  = argument.scrape_timeout.value
+
+		// Each Alloy sees only its own host's containers through the local
+		// socket, so there is nothing to distribute across peers.
+		clustering {
+			enabled = false
+		}
+	}
+
+	prometheus.remote_write "default" {
+		endpoint {
+			url = argument.endpoint_url.value
+
+			basic_auth {
+				username = argument.endpoint_basic_auth_username.value
+				password = argument.endpoint_basic_auth_password.value
+			}
+
+			headers = {
+				"X-Scope-OrgID" = argument.tenant_id.value,
+			}
+		}
+
+		external_labels = coalesce(argument.external_labels.value, {
+			region       = coalesce(argument.region.value, ""),
+			zone         = coalesce(argument.zone.value, ""),
+			cluster_name = coalesce(argument.cluster_name.value, ""),
+		})
+	}
+}

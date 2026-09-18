@@ -5,7 +5,7 @@
 // backend (e.g. Mimir) under a single tenant. Because each instance reads its
 // own node's /proc, /sys and root filesystem via host mounts and scrapes only
 // the local exporter, it is inherently node-local and is meant to run as a
-// DaemonSet.
+// DaemonSet, or as a single Docker/Podman container on a plain container host.
 //
 // This is deliberately single-tenant and node-scoped: clustering is disabled
 // so scrapes are NOT distributed across peers (that would scatter the series
@@ -17,14 +17,25 @@
 //   - Stamps instance and node labels from the local node name.
 //   - Stamps region / zone / cluster_name external labels.
 //   - Embedded remote_write so the tenant (X-Scope-OrgID) is set per instance.
+//   - Skips Docker, Podman and containerd per-container mounts, so container
+//     churn does not churn node_filesystem_* series.
 //
 // Requirements:
 //   - Host /, /proc and /sys mounted read-only into the collector at
 //     /host/root, /host/proc and /host/sys respectively. The root mount needs
-//     mountPropagation: HostToContainer so the host's /run tmpfs is visible
-//     underneath it — the diskstats collector reads udev data from there.
-//   - K8S_NODE_NAME exposed to the collector (the Grafana Alloy Helm chart
-//     injects this automatically from spec.nodeName); or pass node_name.
+//     mountPropagation: HostToContainer (rslave under Docker/Podman) so the
+//     host's /run tmpfs is visible underneath it — the diskstats collector
+//     reads udev data from there.
+//   - Kubernetes: K8S_NODE_NAME exposed to the collector (the Grafana Alloy
+//     Helm chart injects this automatically from spec.nodeName); or pass
+//     node_name.
+//   - Docker/Podman: run with --pid=host and --network=host. /host/proc/net
+//     resolves to the network namespace of the reading process, so without
+//     host networking node_network_* reports the container's own interfaces
+//     rather than the host's. The node name falls back to the container's
+//     hostname, which under --network=host is the host's on both Docker and
+//     Podman (verified); pass node_name if you cannot use host networking.
+//     See the containers declare below for a full run command.
 //
 // Usage:
 //   host_metrics.unix "node" {
@@ -53,7 +64,7 @@ declare "unix" {
 
 	// -- Optional -----------------------------------------------------------
 	argument "node_name" {
-		comment  = "Node name for the instance/node labels (default: sys.env(\"K8S_NODE_NAME\"), injected by the Alloy Helm chart)"
+		comment  = "Node name for the instance/node labels (default: sys.env(\"K8S_NODE_NAME\"), injected by the Alloy Helm chart; outside Kubernetes, the hostname)"
 		optional = true
 	}
 	argument "region" {
@@ -66,6 +77,18 @@ declare "unix" {
 	}
 	argument "cluster_name" {
 		comment  = "Value for the cluster_name external label (default: \"\", unset)"
+		optional = true
+	}
+	argument "job_name" {
+		comment  = "Value for the job label (default: \"integrations/unix\", the exporter's own). Set it to keep an existing job label when migrating a hand-written config onto this module, so dashboards and alerts selecting on it keep matching."
+		optional = true
+	}
+	// Alloy has no map-merge function, so this REPLACES the default external
+	// label set rather than adding to it: a caller that passes it and still
+	// wants region/zone/cluster_name has to include them here. Region etc.
+	// stay as named arguments because they are the common case.
+	argument "external_labels" {
+		comment  = "Complete external_labels map for the embedded remote_write, REPLACING the region/zone/cluster_name defaults (default: unset, which keeps them). Use it to carry site-specific labels such as environment or role."
 		optional = true
 	}
 
@@ -90,7 +113,18 @@ declare "unix" {
 		disable_collectors = ["xfs"]
 
 		filesystem {
-			mount_points_exclude = "^/(dev|proc|sys|var/lib/docker/.+|var/lib/kubelet/.+|run/containerd/.+|run/credentials/.+)($|/)"
+			// Podman's per-container /dev/shm is a tmpfs, so fs_types_exclude
+			// does not catch it: it lives under graphroot overlay-containers/
+			// <id>/userdata/shm -- /var/lib/containers/storage rootful,
+			// ~/.local/share/containers/storage rootless (/var/home on
+			// Fedora CoreOS-style hosts) -- next to runroot state under
+			// /run/containers/storage or /run/user/<uid>/containers. Docker's
+			// equivalent sits under /var/lib/docker/containers/<id>/mounts/shm.
+			// On the Podman hosts checked this drops one tmpfs mount per
+			// container -- 11 of them, churning on every restart -- plus
+			// Podman's bind of graphroot/overlay onto itself, which reports
+			// the same device as /var and would double-count its capacity.
+			mount_points_exclude = "^/(dev|proc|sys|var/lib/docker/.+|var/lib/containers/storage/.+|var/lib/kubelet/.+|run/containerd/.+|run/containers/storage/.+|run/credentials/.+|run/user/[0-9]+/containers/.+|.+/\\.local/share/containers/storage/.+)($|/)"
 			// mount_points_exclude = "^/(dev|proc|sys|var/lib/docker/.+|var/lib/kubelet/.+|run/containerd/io\.containerd\.grpc\.v1\.cri/sandboxes/[a-f0-9]{64}/shm)($|/)"
 			fs_types_exclude     = "^(autofs|binfmt_misc|bpf|cgroup2?|configfs|debugfs|devpts|devtmpfs|fusectl|hugetlbfs|iso9660|mqueue|nsfs|overlay|proc|procfs|pstore|rpc_pipefs|securityfs|selinuxfs|squashfs|sysfs|tracefs)$"
 		}
@@ -103,14 +137,26 @@ declare "unix" {
 	discovery.relabel "node" {
 		targets = prometheus.exporter.unix.node.targets
 
-		// Label every node series with the node it came from.
+		// Label every node series with the node it came from. The hostname
+		// fallback only applies outside Kubernetes, where K8S_NODE_NAME is
+		// unset; without it instance would be empty and Prometheus would
+		// replace it with the exporter's internal address.
 		rule {
 			target_label = "instance"
-			replacement  = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"))
+			replacement  = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"), constants.hostname)
 		}
 		rule {
 			target_label = "node"
-			replacement  = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"))
+			replacement  = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"), constants.hostname)
+		}
+
+		// Set job explicitly rather than relying on prometheus.scrape's
+		// job_name: exporter targets already carry job="integrations/unix",
+		// and a target's own job label wins over the scrape's default, so
+		// job_name alone would be ignored.
+		rule {
+			target_label = "job"
+			replacement  = coalesce(argument.job_name.value, "integrations/unix")
 		}
 	}
 
@@ -141,11 +187,11 @@ declare "unix" {
 			}
 		}
 
-		external_labels = {
+		external_labels = coalesce(argument.external_labels.value, {
 			region       = coalesce(argument.region.value, ""),
 			zone         = coalesce(argument.zone.value, ""),
 			cluster_name = coalesce(argument.cluster_name.value, ""),
-		}
+		})
 	}
 }
 
@@ -640,5 +686,291 @@ declare "control_plane" {
 			zone         = coalesce(argument.zone.value, ""),
 			cluster_name = coalesce(argument.cluster_name.value, ""),
 		}
+	}
+}
+
+// containers
+//
+// Per-container CPU, memory, block I/O and pids metrics on hosts that run
+// containers directly under Docker and/or Podman, where there is no kubelet
+// to scrape cAdvisor from. Runs the embedded cAdvisor
+// (prometheus.exporter.cadvisor) and remote-writes under a single tenant.
+// Node-scoped and single-tenant like unix: clustering is disabled and
+// instance=node.
+//
+// One declare for both runtimes rather than one each: cAdvisor keeps
+// process-global state, so Alloy supports a single prometheus.exporter.cadvisor
+// per process. Instantiate this once per Alloy; a host running both Docker and
+// Podman is covered by that one instance.
+//
+// How each runtime is seen:
+//   - Docker: through cAdvisor's Docker handler over docker_host, with name,
+//     image and the allowlisted container labels, plus per-container network.
+//     Per-container filesystem USAGE (container_fs_usage_bytes and friends for
+//     a container id) is missing when Docker uses the containerd image store,
+//     the default for fresh installs since Docker 29: cAdvisor takes the
+//     container's rootfs path from containerd and cannot map it to a device.
+//     container_fs_* is then only reported for the host root cgroup. Verified
+//     on Docker 29.4 with driver-type io.containerd.snapshotter.v1.
+//   - Podman: cAdvisor has a Podman handler but Alloy does not compile it in,
+//     so Podman containers fall through to the generic cgroup (raw) handler.
+//     That handler knows only the cgroup path: CPU, memory, block I/O and
+//     pids are complete, but there is no name, image or labels, and no
+//     per-container network or filesystem metrics. container_id is recovered
+//     from the cgroup path so series stay identifiable, and containers run as
+//     systemd units via Quadlet also get name=<unit> from it -- which in
+//     practice covers a Quadlet-managed host entirely, since every unit lands
+//     in /system.slice/<unit>.service/libpod-payload-<id>. Only ad-hoc
+//     `podman run` containers, which sit in /machine.slice, stay unnamed.
+//
+// Do NOT point docker_host at Podman's Docker-compatible socket to get names.
+// The Docker handler accepts the container, then looks for Docker's on-disk
+// layer database to locate its root filesystem, does not find it, and fails
+// to create the handler -- the container is dropped outright rather than
+// falling back to the raw handler.
+//
+// Labels added to container series:
+//   runtime       "docker" or "podman".
+//   container_id  12-character short ID, as `docker ps` / `podman ps` print it.
+//   name          Docker: the container name. Podman: the Quadlet unit name
+//                 when run as one, otherwise unset.
+//
+// Cardinality: cAdvisor runs with docker_only = false, so it tracks every
+// cgroup on the host -- each systemd service, user session and scope -- not
+// just containers. docker_only = true would suppress those, but it also
+// disables the raw handler Podman depends on, and its prefix allowlist cannot
+// express rootless or Quadlet cgroup paths, which embed a uid or unit name.
+// So collection stays broad and prometheus.relabel keeps only machine-level
+// series, the root cgroup (id="/"), and Docker/Podman container cgroups.
+// Podman's conmon scopes and nested cgroups inside a container are dropped so
+// container sums are not double-counted.
+//
+// The machine_* series (machine_cpu_cores, machine_memory_bytes, ...) are kept
+// by those rules but land unreliably, which is cAdvisor's doing, not theirs:
+// it stamps them with the moment it read the machine info and never advances
+// that timestamp, so only the first write after a restart is accepted and
+// every later copy is a duplicate sample. Do not build on them -- the unix
+// declare reports the same capacity as node_cpu_seconds_total and
+// node_memory_MemTotal_bytes, with timestamps that move.
+//
+// Requirements (Alloy in a container; natively on the host none of the mounts
+// or flags apply):
+//   - Root, --privileged, --pid=host and --cgroupns=host, so cgroup and
+//     /proc paths resolve to the host's.
+//   - Host / mounted read-only at /rootfs, in addition to unix's /host/root.
+//     cAdvisor hardcodes this path: when /rootfs/proc exists it reads host
+//     files through /rootfs, including Docker's layer database under
+//     /var/lib/docker. Without it every Docker container fails to register.
+//   - /sys at /sys and /dev/disk at /dev/disk, read-only.
+//   - Docker only: the Docker socket at docker_host, the containerd socket at
+//     /run/containerd/containerd.sock, and /var/lib/docker read-only at the
+//     SAME path. Docker Engine 29+ fresh installs use the containerd image
+//     store, where cAdvisor resolves each container's root filesystem through
+//     containerd and then stats the absolute path containerd reports
+//     (/var/lib/docker/rootfs/overlayfs/<id>) WITHOUT the /rootfs prefix it
+//     applies elsewhere. Unmounted, that stat fails and every container logs
+//     "failed to collect filesystem stats" on each housekeeping pass.
+//
+// Run (rootful Docker; for Podman use `podman run` with the same flags and
+// drop the two socket mounts on a Podman-only host):
+//   docker run -d --name alloy --user 0 --privileged \
+//     --pid=host --network=host --cgroupns=host \
+//     -v /:/host/root:ro,rslave -v /proc:/host/proc:ro -v /sys:/host/sys:ro \
+//     -v /:/rootfs:ro -v /sys:/sys:ro -v /dev/disk:/dev/disk:ro \
+//     -v /var/run/docker.sock:/var/run/docker.sock:ro \
+//     -v /run/containerd/containerd.sock:/run/containerd/containerd.sock:ro \
+//     -v /var/lib/docker:/var/lib/docker:ro \
+//     -v ./config.alloy:/etc/alloy/config.alloy:ro \
+//     grafana/alloy:v1.19.2 run /etc/alloy/config.alloy
+//
+// Verified end to end on Ubuntu 24.04 + Docker 29.4 (containerd image store,
+// 12 Compose containers) and Fedora CoreOS + Podman 5.7.1 (11 Quadlet units),
+// with this command: both declares healthy, no errors, every container
+// reported and named, and no cgroup other than containers and the host root.
+//
+// Usage:
+//   host_metrics.containers "containers" {
+//       tenant_id                    = "my-tenant"
+//       endpoint_url                 = sys.env("MIMIR_ENDPOINT_URL")
+//       endpoint_basic_auth_username = sys.env("AUTH_BASIC_USERNAME")
+//       endpoint_basic_auth_password = sys.env("AUTH_BASIC_PASSWORD")
+//       node_name                    = sys.env("NODE_NAME")
+//       region                       = sys.env("REGION")
+//       zone                         = sys.env("ZONE")
+//       cluster_name                 = sys.env("CLUSTER_NAME")
+//   }
+declare "containers" {
+	// -- Required -----------------------------------------------------------
+	argument "tenant_id" {
+		comment = "The tenant (X-Scope-OrgID) to write container metrics to"
+	}
+	argument "endpoint_url" {
+		comment = "Prometheus-compatible remote_write URL (e.g. Mimir)"
+	}
+	argument "endpoint_basic_auth_username" {
+		comment = "Basic-auth username for the remote_write endpoint"
+	}
+	argument "endpoint_basic_auth_password" {
+		comment = "Basic-auth password for the remote_write endpoint"
+	}
+
+	// -- Optional -----------------------------------------------------------
+	argument "node_name" {
+		comment  = "Node name for the instance/node labels (default: sys.env(\"K8S_NODE_NAME\"), else the hostname)"
+		optional = true
+	}
+	argument "docker_host" {
+		comment  = "Docker Engine endpoint (default: \"unix:///var/run/docker.sock\"). On a Podman-only host leave it: cAdvisor logs that the Docker factory failed to register and carries on. Never Podman's socket -- see the header."
+		optional = true
+		default  = "unix:///var/run/docker.sock"
+	}
+	// default rather than coalesce() at the use site: an explicit [] is a
+	// zero value to coalesce and would silently bring the defaults back.
+	argument "allowlisted_container_labels" {
+		comment  = "Docker container labels to keep as container_label_<name> (default: the Compose project and service). Every other label is dropped: images commonly carry a dozen OCI annotations that would otherwise land on every series. Docker only; Podman containers have no labels here."
+		optional = true
+		default  = ["com.docker.compose.project", "com.docker.compose.service"]
+	}
+	argument "region" {
+		comment  = "Value for the region external label (default: \"\", unset)"
+		optional = true
+	}
+	argument "zone" {
+		comment  = "Value for the zone external label (default: \"\", unset)"
+		optional = true
+	}
+	argument "cluster_name" {
+		comment  = "Value for the cluster_name external label (default: \"\", unset)"
+		optional = true
+	}
+	argument "job_name" {
+		comment  = "Value for the job label (default: \"integrations/cadvisor\", the exporter's own). Set it to match an existing convention so dashboards and alerts selecting on job keep matching."
+		optional = true
+	}
+	// Replaces rather than extends the default set -- see the note on the
+	// same argument in unix above.
+	argument "external_labels" {
+		comment  = "Complete external_labels map for the embedded remote_write, REPLACING the region/zone/cluster_name defaults (default: unset, which keeps them). Use it to carry site-specific labels such as environment or role."
+		optional = true
+	}
+
+	prometheus.exporter.cadvisor "containers" {
+		docker_host = argument.docker_host.value
+
+		// false is load-bearing for Podman -- see the header.
+		docker_only = false
+
+		store_container_labels       = false
+		allowlisted_container_labels = argument.allowlisted_container_labels.value
+	}
+
+	discovery.relabel "containers" {
+		targets = prometheus.exporter.cadvisor.containers.targets
+
+		rule {
+			target_label = "instance"
+			replacement  = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"), constants.hostname)
+		}
+		rule {
+			target_label = "node"
+			replacement  = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"), constants.hostname)
+		}
+
+		// Explicit for the same reason as in unix: the exporter's target
+		// already carries job="integrations/cadvisor".
+		rule {
+			target_label = "job"
+			replacement  = coalesce(argument.job_name.value, "integrations/cadvisor")
+		}
+	}
+
+	prometheus.scrape "containers" {
+		targets    = discovery.relabel.containers.output
+		forward_to = [prometheus.relabel.containers.receiver]
+
+		scrape_interval = "30s"
+		scrape_timeout  = "10s"
+
+		// Local exporter only — do not distribute across the cluster.
+		clustering {
+			enabled = false
+		}
+	}
+
+	prometheus.relabel "containers" {
+		forward_to = [prometheus.remote_write.default.receiver]
+
+		// Docker first, and before any rule below writes name: only the
+		// Docker handler names containers, so a name at this point means a
+		// Docker container regardless of its cgroup layout (systemd or
+		// cgroupfs driver, rootless, custom --cgroup-parent).
+		rule {
+			source_labels = ["name"]
+			regex         = ".+"
+			target_label  = "runtime"
+			replacement   = "docker"
+		}
+
+		// Podman container cgroups, matched on the leaf so every layout is
+		// covered: /machine.slice/libpod-<id>.scope (rootful, systemd),
+		// /libpod_parent/libpod-<id> (cgroupfs), .../user.slice/libpod-<id>.scope
+		// (rootless) and .../<unit>.service/libpod-payload-<id> (Quadlet's
+		// --cgroups=split). Anchored at the end, so libpod-conmon-<id>.scope
+		// (the conmon monitor process, not the container) and cgroups nested
+		// inside a container are left unmatched and dropped below.
+		rule {
+			source_labels = ["id"]
+			regex         = ".*/libpod-(payload-)?[0-9a-f]{64}(\\.scope)?"
+			target_label  = "runtime"
+			replacement   = "podman"
+		}
+
+		// Keep containers, machine-level series (no id: machine_*, and the
+		// exporter's own) and the root cgroup; drop every other cgroup.
+		rule {
+			source_labels = ["runtime", "id"]
+			separator     = ";"
+			regex         = "(docker|podman);.*|;/?"
+			action        = "keep"
+		}
+
+		rule {
+			source_labels = ["runtime", "id"]
+			separator     = ";"
+			regex         = "(docker|podman);.*[/-]([0-9a-f]{12})[0-9a-f]{52}(\\.scope)?"
+			target_label  = "container_id"
+			replacement   = "$2"
+		}
+
+		// Quadlet containers carry their unit in the cgroup path, the one
+		// name the raw handler can offer.
+		rule {
+			source_labels = ["runtime", "id"]
+			separator     = ";"
+			regex         = "podman;.*/([^/]+)\\.service/libpod-payload-[0-9a-f]{64}"
+			target_label  = "name"
+			replacement   = "$1"
+		}
+	}
+
+	prometheus.remote_write "default" {
+		endpoint {
+			url = argument.endpoint_url.value
+
+			basic_auth {
+				username = argument.endpoint_basic_auth_username.value
+				password = argument.endpoint_basic_auth_password.value
+			}
+
+			headers = {
+				"X-Scope-OrgID" = argument.tenant_id.value,
+			}
+		}
+
+		external_labels = coalesce(argument.external_labels.value, {
+			region       = coalesce(argument.region.value, ""),
+			zone         = coalesce(argument.zone.value, ""),
+			cluster_name = coalesce(argument.cluster_name.value, ""),
+		})
 	}
 }
