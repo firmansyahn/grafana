@@ -1,0 +1,1414 @@
+// host_logs
+//
+// Collect a host's OWN logs -- the systemd journal, the classic text files
+// under /var/log, and syslog forwarded over the network by machines and
+// appliances that cannot run a collector -- and ship them to Loki under one
+// tenant.
+//
+// This is the logs counterpart to host_metrics: the same deployment shape (one
+// collector per host, a DaemonSet on Kubernetes or a single container on a
+// plain Docker/Podman host) and the same `node` label, so a host's metrics and
+// its logs join on it.
+//
+// Three declares, each usable on its own:
+//
+//   journal  The systemd journal (loki.source.journal). Where nearly every
+//            host log lives on a modern distribution: sshd, sudo, cron, the
+//            kernel, every systemd unit, and the container runtime itself.
+//   files    Classic text files under /var/log (loki.source.file), for hosts
+//            where rsyslog still writes syslog/messages/auth.log and for
+//            anything journald never sees (application logs, appliance logs).
+//   syslog   A network receiver (loki.source.syslog) for rsyslog/syslog-ng
+//            forwarders, switches, firewalls and other appliances.
+//
+// Shared label shape -- one dashboard variable works across all three:
+//
+//   node      the machine the log is ABOUT, never the collector: the journal's
+//             _HOSTNAME, the file host, the SENDER's hostname for received
+//             syslog. Matches host_metrics' node label.
+//   app       the program: SYSLOG_IDENTIFIER, the syslog APP-NAME, or the tag
+//             parsed out of a /var/log line.
+//   level     severity normalized to one vocabulary (below).
+//   job       which source the entry came from (integrations/journal,
+//             integrations/varlogs, integrations/syslog by default).
+//   unit      systemd unit -- journal only.
+//   facility  syslog facility (daemon, auth, local0 ...) -- syslog only.
+//   log_file  basename of the tailed file (auth.log, messages) -- files only.
+//
+// Level vocabulary is shared with k8s_pod_logs_file so a mixed dashboard can
+// select one set of values: fatal, critical, error, warn, info, debug. The
+// eight syslog/journald severities fold onto it as emerg -> fatal,
+// alert/crit -> critical, err -> error, warning -> warn, notice -> info.
+//
+// High-cardinality identity -- pid, boot_id, msg_id, the sender's IP -- is
+// demoted to STRUCTURED METADATA instead of being indexed, the same way
+// k8s_pod_logs_file treats pod: still queryable at query time (`| pid="123"`),
+// no stream churn. That needs Loki with allow_structured_metadata: true
+// (tsdb + schema v13).
+//
+// Delivery -- every declare supports both, and they are mutually exclusive:
+//   - Default: the embedded loki.write, configured with endpoint_url plus
+//     endpoint_basic_auth_*, exactly like host_metrics' embedded remote_write.
+//   - forward_to: point it at your own loki.process (site-specific redaction
+//     or drops) which then writes, and the embedded writer is never fed.
+//     tenant_id still applies either way -- stage.tenant stamps it per entry,
+//     and a per-entry tenant overrides whatever tenant_id your own loki.write
+//     endpoint carries.
+//
+// What the journal declare drops by DEFAULT, both reversible with one
+// argument, both measured on the Podman hosts here:
+//   - Container stdout/stderr (container_logs = "keep" to collect it): 69% of
+//     journal entries there. Container logs are collected by other means.
+//   - Podman healthcheck bookkeeping (healthcheck_noise = "keep"): another
+//     ~30%, the "container health_status" lines plus the audit
+//     SERVICE_START/STOP pairs for the transient units they run in.
+// Together those take a Podman host from ~355k journal entries a day to a few
+// tens of thousands, and leave the host's own story intact: logins, sudo,
+// systemd, sshd, the kernel, and audit records for real service transitions.
+//
+// Beyond those two, the module deliberately does NOT redact or drop anything
+// except empty lines: the rest is site-specific. Add it in the loki.process
+// you chain via forward_to.
+//
+// Positions: the journal cursor and the file offsets live in Alloy's storage
+// path (--storage.path, /var/lib/alloy/data in the container images). Without
+// a persistent volume there, a restart re-reads the journal back to max_age
+// and re-tails files from the top.
+
+// host_logs.journal
+//
+// Read the systemd journal and ship it to Loki.
+//
+// Requirements:
+//   - Linux with systemd. In a container, mount the host journal read-only:
+//       -v /var/log/journal:/var/log/journal:ro \
+//       -v /run/log/journal:/run/log/journal:ro \
+//       -v /etc/machine-id:/etc/machine-id:ro
+//     Both journal directories matter: /var/log/journal is the persistent
+//     journal and /run/log/journal the volatile one, and a host with
+//     Storage=volatile (or no persistent journal configured yet) has ONLY the
+//     latter. Leaving journal_path unset makes Alloy read both.
+//   - Read access to the journal files: run as root, or add the collector's
+//     user to the `systemd-journal` and `adm` groups. Without it the component
+//     stays healthy and silently collects nothing.
+//
+// Usage (Docker/Podman host):
+//   host_logs.journal "node" {
+//       tenant_id                    = "my-tenant"
+//       endpoint_url                 = sys.env("LOKI_ENDPOINT_URL")
+//       endpoint_basic_auth_username = sys.env("AUTH_BASIC_USERNAME")
+//       endpoint_basic_auth_password = sys.env("AUTH_BASIC_PASSWORD")
+//       region                       = sys.env("REGION")
+//       cluster_name                 = sys.env("CLUSTER_NAME")
+//   }
+//
+// Usage (chained into your own redaction pipeline):
+//   host_logs.journal "node" {
+//       tenant_id  = "my-tenant"
+//       forward_to = [loki.process.redact.receiver]
+//   }
+declare "journal" {
+	// -- Required -----------------------------------------------------------
+	argument "tenant_id" {
+		comment = "The Loki tenant (X-Scope-OrgID) to stamp on collected logs"
+	}
+
+	// -- Delivery: embedded writer, or forward_to ---------------------------
+	argument "forward_to" {
+		comment  = "list(LogsReceiver) to send logs to INSTEAD of the embedded loki.write -- e.g. your own loki.process for site-specific redaction, which then writes (default: unset, use the embedded writer)"
+		optional = true
+	}
+	argument "endpoint_url" {
+		comment  = "Loki push URL for the embedded writer, e.g. https://loki.example.com/loki/api/v1/push. Required unless forward_to is set; the default points at a local Loki so a misconfiguration fails loudly with connection errors rather than silently discarding logs."
+		optional = true
+		default  = "http://localhost:3100/loki/api/v1/push"
+	}
+	// Alloy has no conditional blocks, so basic_auth is always present on the
+	// embedded endpoint. Left empty it sends an empty Basic header, which an
+	// anonymous Loki (auth_enabled: false) ignores.
+	argument "endpoint_basic_auth_username" {
+		comment  = "Basic-auth username for the embedded writer (default: \"\", no credentials)"
+		optional = true
+		default  = ""
+	}
+	argument "endpoint_basic_auth_password" {
+		comment  = "Basic-auth password for the embedded writer (default: \"\", no credentials)"
+		optional = true
+		default  = ""
+	}
+
+	// -- Optional -----------------------------------------------------------
+	argument "node_name" {
+		comment  = "Value for the node label (default: sys.env(\"K8S_NODE_NAME\"), else the journal's own _HOSTNAME, which is the HOST's name even when the collector runs in a container)"
+		optional = true
+	}
+	argument "journal_path" {
+		comment  = "Directory to read journal files from (default: \"\", which reads both /var/log/journal and /run/log/journal)"
+		optional = true
+		default  = ""
+	}
+	argument "max_age" {
+		comment  = "How far back to read on a FIRST start, when no cursor exists yet (default: \"7h\"). Afterwards Alloy resumes from its stored cursor."
+		optional = true
+		default  = "7h"
+	}
+	argument "matches" {
+		comment  = "systemd journal match filter applied at the source, space-separated FIELD=VALUE pairs ANDed together, e.g. \"_TRANSPORT=kernel\" or \"_SYSTEMD_UNIT=ssh.service\" (default: \"\", everything). Filtering here is cheaper than dropping later. journalctl's \"+\" (OR) is not supported."
+		optional = true
+		default  = ""
+	}
+	argument "container_logs" {
+		comment  = "What to do with container stdout/stderr that a runtime's journald log driver writes into the journal: \"drop\" (default, they are collected by other means) or \"keep\". Measured at 69% of all journal entries on the Podman hosts here; a Docker host on the default json-file driver has none of them in the journal at all."
+		optional = true
+		default  = "drop"
+	}
+	argument "drop_units" {
+		comment  = "Regex matching the unit label of entries whose INFO-level chatter is dropped -- periodic timers that log a start/stop pair on every run and say nothing worth keeping when they succeed (default: \"fwupd-refresh.service\"). Set \"\" to keep everything. Fully anchored, as LogQL label matchers always are, so it matches whole unit names only. Only level=info is dropped, so a failure from the same unit still arrives at warn or error."
+		optional = true
+		default  = "fwupd-refresh.service"
+	}
+	argument "healthcheck_noise" {
+		comment  = "What to do with Podman healthcheck bookkeeping -- the \"container health_status\" lines and the audit SERVICE_START/STOP pairs for the transient units they run in: \"drop\" (default) or \"keep\". Roughly 30% of journal entries on the Podman hosts here. Use \"keep\" where audit completeness is a compliance requirement."
+		optional = true
+		default  = "drop"
+	}
+	argument "job_name" {
+		comment  = "Value for the job label (default: \"integrations/journal\")"
+		optional = true
+		default  = "integrations/journal"
+	}
+	argument "cluster_name" {
+		comment  = "Value for the cluster_name label (default: \"\", unset)"
+		optional = true
+	}
+	argument "region" {
+		comment  = "Value for the region label (default: \"\", unset)"
+		optional = true
+	}
+	argument "zone" {
+		comment  = "Value for the zone label (default: \"\", unset)"
+		optional = true
+	}
+	// Same contract as host_metrics' external_labels: REPLACES the default set
+	// rather than merging with it, since Alloy has no map-merge function.
+	// Applied as static labels inside the pipeline rather than on loki.write,
+	// so they survive forward_to too.
+	argument "external_labels" {
+		comment  = "Complete map of static labels REPLACING the region/zone/cluster_name defaults (default: unset, which keeps them). Use it to carry the same vocabulary a host's metrics already use, e.g. { environment = \"production\", region = \"eu-west-1\", role = \"database\" }."
+		optional = true
+	}
+
+	loki.source.journal "host" {
+		forward_to    = [loki.process.journal.receiver]
+		relabel_rules = loki.relabel.journal.rules
+
+		path    = argument.journal_path.value
+		max_age = argument.max_age.value
+		matches = argument.matches.value
+
+		// false keeps the line as the journal's MESSAGE field. true would ship
+		// the whole entry as JSON, duplicating in the line every field that is
+		// already a label below.
+		format_as_json = false
+	}
+
+	// Journal fields reach relabeling as __journal_<field lowercased>. Fields
+	// whose systemd name already starts with an underscore therefore get TWO:
+	// _SYSTEMD_UNIT -> __journal__systemd_unit. Every __-prefixed label is
+	// dropped before the entry is forwarded, so anything worth keeping has to
+	// be copied onto a real label name here -- and an entry that ends up with
+	// no labels at all is discarded.
+	loki.relabel "journal" {
+		forward_to = []
+
+		// Marks container stdout/stderr for the pipeline, which drops it.
+		// Podman's and Docker's journald log drivers stamp CONTAINER_NAME and
+		// CONTAINER_ID on every line a container writes; on the Podman hosts
+		// here that is 3951 of 5727 journal entries over 30 minutes (69%) --
+		// mongodb, patroni, haproxy, pgbouncer, vip-manager. A Docker host on
+		// the default json-file driver puts no container logs in the journal
+		// at all (verified on Docker hosts), so this costs nothing there.
+		//
+		// Dropping them HERE with action = "drop" also works and is cheaper,
+		// but it is the wrong signal: an entry that relabeling drops reaches
+		// the journal tailer with no labels, which counts it as a PARSE ERROR
+		// (loki_source_journal_target_parsing_errors_total, error="empty_
+		// labels"). Deployed that way on one host it logged 8414 "parsing
+		// errors" in one restart window for logs that were being excluded
+		// exactly as intended, which would fire any alert watching that metric
+		// for a broken journal reader. The pipeline's stage.match instead
+		// counts them as loki_process_dropped_lines_total with a named reason.
+		rule {
+			source_labels = ["__journal_container_name"]
+			action        = "replace"
+			target_label  = "tmp_container"
+		}
+
+		// The unit the entry is ABOUT, which is not always the unit that emitted
+		// it. systemd's own messages about a unit ("Started foo.service",
+		// "foo.service: Deactivated successfully") are emitted BY PID 1, so
+		// their _SYSTEMD_UNIT is init.scope while the unit they concern is in
+		// UNIT. Reading _SYSTEMD_UNIT first would label every one of those
+		// init.scope, which buries a unit's start/stop history under a label
+		// nobody queries and makes `{unit="foo.service"}` an incomplete answer.
+		//
+		// So UNIT wins where it exists, and _SYSTEMD_UNIT is the fallback that
+		// covers the ordinary case: a process logging from inside its own unit.
+		// Each fallback joins the current value with the next source and fires
+		// only when the first is empty -- nothing before the ";" separator.
+		rule {
+			source_labels = ["__journal_unit"]
+			action        = "replace"
+			target_label  = "unit"
+		}
+
+		rule {
+			source_labels = ["unit", "__journal__systemd_unit"]
+			action        = "replace"
+			separator     = ";"
+			regex         = "^;(.+)$"
+			replacement   = "$1"
+			target_label  = "unit"
+		}
+
+		// Audit records name the unit they are ABOUT, and journald has already
+		// parsed it out of the record into its own field -- there is nothing to
+		// regex out of the message text. Without this an audit SERVICE_START
+		// carries no unit at all, so a query for a unit misses every audit
+		// record concerning it. Same empty-only fallback as above, so a real
+		// _SYSTEMD_UNIT is never overwritten.
+		rule {
+			source_labels = ["unit", "__journal_audit_field_unit"]
+			action        = "replace"
+			separator     = ";"
+			regex         = "^;(.+)$"
+			replacement   = "$1"
+			target_label  = "unit"
+		}
+
+		// Audit writes the unit WITHOUT its suffix -- "alloy" where systemd
+		// says "alloy.service", measured across all 34 unit values this host's
+		// audit subsystem produces. Left alone that gives every service two
+		// label values, one per source, and a query on either misses half its
+		// entries. SERVICE_START and SERVICE_STOP are emitted for services, so
+		// restoring ".service" is the correct normalization rather than a
+		// guess. The regex is fully anchored and [^.]+ cannot match a value
+		// that already has a suffix, so systemd-derived names are untouched --
+		// every real systemd unit name carries one (.service, .scope, .slice,
+		// .mount, .socket, .timer, .target).
+		//
+		// This also puts the podman healthcheck transients back into the form
+		// the collapse rule below expects: <hex>-<hex> becomes
+		// <hex>-<hex>.service and is then folded to transient.service.
+		rule {
+			source_labels = ["unit"]
+			action        = "replace"
+			regex         = "([^.]+)"
+			replacement   = "$1.service"
+			target_label  = "unit"
+		}
+
+		// Collapse the unit names that are minted per event. Each of these
+		// embeds an id -- a login session, a container, a transient
+		// systemd-run job -- so indexed verbatim they open a new Loki stream
+		// per login and per container start, which on the Docker/Podman hosts
+		// this module targets is the single biggest cardinality risk here. The
+		// identity stays in the line and in app/pid.
+		rule {
+			source_labels = ["unit"]
+			action        = "replace"
+			regex         = "session-[0-9]+\\.scope"
+			replacement   = "session.scope"
+			target_label  = "unit"
+		}
+
+		rule {
+			source_labels = ["unit"]
+			action        = "replace"
+			regex         = "(docker|libpod|libpod-conmon|crio|crio-conmon|cri-containerd)-[0-9a-f]{12,64}\\.scope"
+			replacement   = "$1.scope"
+			target_label  = "unit"
+		}
+
+		rule {
+			source_labels = ["unit"]
+			action        = "replace"
+			regex         = "run-[a-z][0-9a-f]+\\.(scope|service)"
+			replacement   = "run.$1"
+			target_label  = "unit"
+		}
+
+		// Podman healthchecks. Podman runs each container's healthcheck as a
+		// TRANSIENT unit named <container-id>-<random>.service that exists only
+		// for that run -- `systemctl show` on one reports nothing but its own
+		// id. Measured on the Fedora/Podman hosts here: 15-16 such names per
+		// host in the journal, every one carrying app="podman" and a "container
+		// health_status <id>" message, and all of them rotating whenever a
+		// container is recreated. The hash is pure churn as a stream label and
+		// means nothing to a reader; app already says podman and the container
+		// id stays in the line.
+		rule {
+			source_labels = ["unit"]
+			action        = "replace"
+			regex         = "[0-9a-f]{32,}-[0-9a-f]{8,}\\.(service|scope|timer)"
+			replacement   = "transient.$1"
+			target_label  = "unit"
+		}
+
+		// Everything else a container runtime names after a container ID.
+		// Reading UNIT rather than _SYSTEMD_UNIT (above) surfaced these: they
+		// were always in the journal, but as the SUBJECT of PID 1's messages,
+		// so they used to hide behind init.scope. On this host they are the
+		// single largest source of unit values -- of 207 distinct subjects, 82
+		// carry a container-ID-sized hex run, and 49 of those are podman's
+		// per-container overlay mounts (…-<64 hex>-merged.mount,
+		// …\x2dcontainers-<64 hex>-userdata-shm.mount), minted and discarded
+		// with every container start.
+		//
+		// Collapsed to the stable prefix, so the name still says which mount
+		// tree it was and the churn stops at the id. The non-greedy prefix
+		// stops at the FIRST 32-character hex run; a real unit name such as
+		// run-user-1000.mount has none and is untouched.
+		rule {
+			source_labels = ["unit"]
+			action        = "replace"
+			regex         = "(.*?)-?[0-9a-f]{32,}.*\\.mount"
+			replacement   = "$1.mount"
+			target_label  = "unit"
+		}
+
+		// The program name. SYSLOG_IDENTIFIER is what journalctl prints and
+		// what a syslog line would call the tag; _COMM (the executable name)
+		// covers entries that set no identifier.
+		rule {
+			source_labels = ["__journal_syslog_identifier"]
+			action        = "replace"
+			target_label  = "app"
+		}
+
+		rule {
+			source_labels = ["app", "__journal__comm"]
+			action        = "replace"
+			separator     = ";"
+			regex         = "^;(.+)$"
+			replacement   = "$1"
+			target_label  = "app"
+		}
+
+		// How the entry reached journald: kernel, syslog, stdout, journal,
+		// audit, driver. Six values at most, and the only way to select the
+		// kernel ring buffer specifically.
+		rule {
+			source_labels = ["__journal__transport"]
+			action        = "replace"
+			target_label  = "transport"
+		}
+
+		// PRIORITY 0-7 is exposed both numerically and as a keyword; the
+		// keyword is already emerg/alert/crit/error/warning/notice/info/debug,
+		// so only the four that differ from our vocabulary need folding.
+		// Relabel regexes are fully anchored, so "crit" never matches
+		// "critical" on a second pass.
+		rule {
+			source_labels = ["__journal_priority_keyword"]
+			action        = "replace"
+			target_label  = "level"
+		}
+
+		rule {
+			source_labels = ["level"]
+			action        = "replace"
+			regex         = "emerg"
+			replacement   = "fatal"
+			target_label  = "level"
+		}
+
+		rule {
+			source_labels = ["level"]
+			action        = "replace"
+			regex         = "alert|crit"
+			replacement   = "critical"
+			target_label  = "level"
+		}
+
+		rule {
+			source_labels = ["level"]
+			action        = "replace"
+			regex         = "warning"
+			replacement   = "warn"
+			target_label  = "level"
+		}
+
+		rule {
+			source_labels = ["level"]
+			action        = "replace"
+			regex         = "notice"
+			replacement   = "info"
+			target_label  = "level"
+		}
+
+		// Kernel audit records carry no PRIORITY, but journald does expose the
+		// record's own structure as fields, so the level comes from the record
+		// itself rather than from parsing its text: _AUDIT_TYPE_NAME names the
+		// record type (AVC, BPF, SERVICE_START; types journald has no name for
+		// come through as AUDIT<number>), and AUDIT_FIELD_RES is the res=
+		// outcome, which on the hosts here takes exactly two values, success
+		// and failed. Both are kept as labels here and demoted to structured
+		// metadata in the pipeline.
+		rule {
+			source_labels = ["__journal__audit_type_name"]
+			action        = "replace"
+			target_label  = "audit_type"
+		}
+
+		rule {
+			source_labels = ["__journal_audit_field_res"]
+			action        = "replace"
+			target_label  = "audit_result"
+		}
+
+		// Each of these fires only when level is still empty -- the ";"-join
+		// matches nothing before the separator -- so a record that DID carry a
+		// priority keeps it. Denials are matched before outcomes because an
+		// SELinux denial carries no res= field of its own.
+		rule {
+			source_labels = ["level", "audit_type"]
+			action        = "replace"
+			separator     = ";"
+			regex         = "^;(AVC|USER_AVC|ANOM_.*|SECCOMP|INTEGRITY_.*)$"
+			replacement   = "warn"
+			target_label  = "level"
+		}
+
+		// A denied or failed operation -- a rejected login, a sudo that was not
+		// permitted. Deliberately warn and not error: on any host reachable
+		// from a network this is continuous background noise (typos, scanners),
+		// and at error it would keep the error panel permanently red and
+		// devalue it. Real faults still arrive as errors by another route --
+		// systemd logs a failed unit start at priority 3 in its own right, so
+		// nothing is lost by keeping the audit copy at warn. The security view
+		// is the failed-auth query, not the level.
+		rule {
+			source_labels = ["level", "audit_result"]
+			action        = "replace"
+			separator     = ";"
+			regex         = "^;failed$"
+			replacement   = "warn"
+			target_label  = "level"
+		}
+
+		// A successful audited operation is exactly what info means: a login
+		// that worked, a service that started, a key that was used.
+		rule {
+			source_labels = ["level", "audit_result"]
+			action        = "replace"
+			separator     = ";"
+			regex         = "^;success$"
+			replacement   = "info"
+			target_label  = "level"
+		}
+
+		// Last resort for an entry that has neither a priority nor an audit
+		// outcome to derive a level from. Without it such entries reach Loki
+		// with no level label at all and any dashboard or alert filtering on
+		// level drops them silently -- which is what happened to every audit
+		// record (26% of entries on the Podman hosts here) before the rules
+		// above gave them one. The value matches what the files declare uses
+		// for a line it cannot parse.
+		rule {
+			source_labels = ["level"]
+			action        = "replace"
+			regex         = "^$"
+			replacement   = "unknown"
+			target_label  = "level"
+		}
+
+		// Set here as ordinary labels so the pipeline can see them, then
+		// demoted to structured metadata in loki.process below.
+		rule {
+			source_labels = ["__journal__pid"]
+			action        = "replace"
+			target_label  = "pid"
+		}
+
+		rule {
+			source_labels = ["__journal__boot_id"]
+			action        = "replace"
+			target_label  = "boot_id"
+		}
+
+		// node identifies the machine the log is about. An explicitly passed
+		// node_name (or K8S_NODE_NAME) wins; otherwise take the journal's own
+		// _HOSTNAME, which journald stamps on every entry as a trusted field
+		// and which is the HOST's name even when the collector reads the
+		// mounted journal from inside a container -- unlike constants.hostname,
+		// which would be the container's id. An empty replacement removes the
+		// label, which is what lets the fallback rule fire.
+		rule {
+			action       = "replace"
+			target_label = "node"
+			replacement  = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"), "")
+		}
+
+		rule {
+			source_labels = ["node", "__journal__hostname"]
+			action        = "replace"
+			separator     = ";"
+			regex         = "^;(.+)$"
+			replacement   = "$1"
+			target_label  = "node"
+		}
+
+		// loki.source.journal attaches its own job label (the component's full
+		// name); overwrite it unconditionally.
+		rule {
+			action       = "replace"
+			target_label = "job"
+			replacement  = argument.job_name.value
+		}
+	}
+
+	loki.process "journal" {
+		// The embedded writer unless the caller supplied its own receivers.
+		forward_to = coalesce(argument.forward_to.value, [loki.write.default.receiver])
+
+		// Container stdout/stderr, marked by the relabel rule above. Dropped
+		// before any other stage runs, and counted under a named reason rather
+		// than as a journal parse error -- see the comment on that rule.
+		//
+		// The "keep" branch selects a label no entry carries, which is a valid
+		// selector matching nothing, since Alloy has no conditional blocks. The
+		// coalesce makes an unknown value (a typo like "Drop") fall back to
+		// that same never-matching selector, so a typo keeps everything rather
+		// than failing the component.
+		stage.match {
+			selector = coalesce({
+				"drop" = `{tmp_container=~".+"}`,
+				"keep" = `{host_logs_never_matches="1"}`,
+			}[coalesce(argument.container_logs.value, "drop")], `{host_logs_never_matches="1"}`)
+
+			action              = "drop"
+			drop_counter_reason = "container_log"
+		}
+
+		// Never reaches Loki: it exists only to carry the marker this far.
+		stage.label_drop {
+			values = ["tmp_container"]
+		}
+
+		// Podman healthcheck bookkeeping. Every healthcheck run emits a podman
+		// "container health_status" line AND a pair of audit SERVICE_START /
+		// SERVICE_STOP records for the transient unit it ran in -- together
+		// about 30% of journal entries on the Podman hosts here, saying
+		// nothing a health metric does not already say.
+		//
+		// The audit selector is deliberately narrow: it matches only records
+		// whose msg names a hex transient unit, so audit records for REAL
+		// service starts and stops survive, as does every login record. These
+		// have to be dropped here rather than in loki.relabel because they are
+		// identified by line content, which relabeling cannot see.
+		//
+		// The "keep" branch selects a label no entry carries -- a valid
+		// selector that matches nothing -- since Alloy has no conditional
+		// blocks. Same coalesce-on-typo reasoning as the container rule above.
+		stage.match {
+			selector = coalesce({
+				"drop" = `{transport="audit"} |~ "SERVICE_(START|STOP).+unit=[0-9a-f]{32,}"`,
+				"keep" = `{host_logs_never_matches="1"}`,
+			}[coalesce(argument.healthcheck_noise.value, "drop")], `{host_logs_never_matches="1"}`)
+
+			action              = "drop"
+			drop_counter_reason = "podman_healthcheck_audit"
+		}
+
+		stage.match {
+			selector = coalesce({
+				"drop" = `{app="podman"} |~ "container health_status"`,
+				"keep" = `{host_logs_never_matches="1"}`,
+			}[coalesce(argument.healthcheck_noise.value, "drop")], `{host_logs_never_matches="1"}`)
+
+			action              = "drop"
+			drop_counter_reason = "podman_healthcheck_status"
+		}
+
+		// Periodic-timer chatter. A unit like fwupd-refresh runs on a timer and
+		// announces itself four times per run -- systemd's "Starting" and
+		// "Finished", its "Deactivated successfully", and an audit
+		// SERVICE_START/SERVICE_STOP pair -- 78 entries a day on an otherwise
+		// idle host here, none of which says anything a failure would not say
+		// louder.
+		//
+		// Matched on the unit LABEL, which works only because the rules above
+		// read UNIT before _SYSTEMD_UNIT: all four of those messages carry the
+		// unit they concern, where previously systemd's two said init.scope
+		// and the audit pair had no unit at all. A label matcher is anchored
+		// and cannot misfire on an unrelated line that merely mentions the
+		// name, which a line filter can.
+		//
+		// Restricted to level=info deliberately: the same unit FAILING still
+		// arrives, because systemd logs a failed unit at priority 3 and the
+		// audit record then carries res=failed, and both land above info.
+		//
+		// The empty case is handled by swapping the SELECTOR: the map yields a
+		// never-matching selector for "" and misses (yielding empty) for any
+		// real pattern, at which point the coalesce falls through to the real
+		// one. An empty value interpolated into the matcher would give
+		// unit=~"", which matches every entry that has NO unit label at all --
+		// most of the journal -- and would silently drop it.
+		stage.match {
+			selector = coalesce({
+				"" = `{host_logs_never_matches="1"}`,
+			}[coalesce(argument.drop_units.value, "")], `{level="info", unit=~"` + argument.drop_units.value + `"}`)
+
+			action              = "drop"
+			drop_counter_reason = "periodic_unit_noise"
+		}
+
+		// Empty-valued entries are omitted rather than indexed as "".
+		stage.static_labels {
+			values = coalesce(argument.external_labels.value, {
+				cluster_name = coalesce(argument.cluster_name.value, ""),
+				region       = coalesce(argument.region.value, ""),
+				zone         = coalesce(argument.zone.value, ""),
+			})
+		}
+
+		// Demote per-process identity. stage.structured_metadata reads the
+		// extracted map, which is seeded with the entry's current labels, and
+		// moving a label into structured metadata removes it from the label
+		// set. pid turns over constantly and boot_id changes on every reboot:
+		// as stream labels they would multiply streams, as structured metadata
+		// they stay queryable (`| pid="1234"`) for free.
+		// audit_type and audit_result join them: they exist only on audit
+		// records, they are what you actually filter on when reading them
+		// (`| audit_result="failed"` beats a regex over the line), and as
+		// stream labels they would multiply the audit streams by the number of
+		// record types for no selector benefit.
+		stage.structured_metadata {
+			values = {
+				pid           = "",
+				boot_id       = "",
+				audit_type    = "",
+				audit_result  = "",
+			}
+		}
+
+		// Per-entry tenant. It overrides the endpoint's tenant_id, so it
+		// applies to the caller's own loki.write too when forward_to is used.
+		stage.tenant {
+			value = argument.tenant_id.value
+		}
+	}
+
+	loki.write "default" {
+		endpoint {
+			url = argument.endpoint_url.value
+
+			basic_auth {
+				username = argument.endpoint_basic_auth_username.value
+				password = argument.endpoint_basic_auth_password.value
+			}
+
+			tenant_id = argument.tenant_id.value
+		}
+	}
+}
+
+// host_logs.files
+//
+// Tail classic text log files under /var/log and ship them to Loki.
+//
+// Complements the journal declare rather than replacing it: use it on hosts
+// where rsyslog still writes /var/log/syslog or /var/log/messages, and for
+// application or appliance logs that never reach journald. Running both on a
+// host that ALSO forwards the journal into rsyslog duplicates entries -- pick
+// one or narrow `path`.
+//
+// Check what the host actually has before reaching for this declare. Ubuntu
+// 24.04 and other rsyslog-less installs ship NO /var/log/syslog, auth.log or
+// kern.log at all -- the journal is the only system log, and the default glob
+// below matches nothing there. On those hosts `journal` is the declare you
+// want, and this one earns its place by tailing what journald never sees:
+// backup jobs, cron-driven scripts, appliance logs.
+//
+// Lines are parsed as syslog when they look like it (BSD "Sep 18 12:34:56
+// host sshd[123]: msg" or an ISO-8601-stamped rsyslog line): the timestamp
+// becomes the entry's own timestamp, hostname/app become labels, the pid
+// becomes structured metadata, and the line is reduced to the message. Lines
+// that match neither are kept verbatim with the read time.
+//
+// Requirements:
+//   - Read access to the files: run as root, or add the collector's user to
+//     the `adm` group (auth.log/secure are usually root:adm 0640).
+//   - In a container, mount the host directory read-only:
+//       -v /var/log:/var/log:ro
+//   - For correct BSD-syslog timestamps, the collector's local time zone must
+//     match the host's: mount -v /etc/localtime:/etc/localtime:ro, set TZ, or
+//     set timestamp_location explicitly. BSD syslog timestamps carry no zone
+//     and no year.
+//
+// Usage:
+//   host_logs.files "node" {
+//       tenant_id                    = "my-tenant"
+//       endpoint_url                 = sys.env("LOKI_ENDPOINT_URL")
+//       endpoint_basic_auth_username = sys.env("AUTH_BASIC_USERNAME")
+//       endpoint_basic_auth_password = sys.env("AUTH_BASIC_PASSWORD")
+//       cluster_name                 = sys.env("CLUSTER_NAME")
+//   }
+declare "files" {
+	// -- Required -----------------------------------------------------------
+	argument "tenant_id" {
+		comment = "The Loki tenant (X-Scope-OrgID) to stamp on collected logs"
+	}
+
+	// -- Delivery: embedded writer, or forward_to ---------------------------
+	argument "forward_to" {
+		comment  = "list(LogsReceiver) to send logs to INSTEAD of the embedded loki.write (default: unset, use the embedded writer)"
+		optional = true
+	}
+	argument "endpoint_url" {
+		comment  = "Loki push URL for the embedded writer. Required unless forward_to is set."
+		optional = true
+		default  = "http://localhost:3100/loki/api/v1/push"
+	}
+	argument "endpoint_basic_auth_username" {
+		comment  = "Basic-auth username for the embedded writer (default: \"\", no credentials)"
+		optional = true
+		default  = ""
+	}
+	argument "endpoint_basic_auth_password" {
+		comment  = "Basic-auth password for the embedded writer (default: \"\", no credentials)"
+		optional = true
+		default  = ""
+	}
+
+	// -- Optional -----------------------------------------------------------
+	argument "path" {
+		comment  = "doublestar glob of files to tail (default: \"/var/log/{syslog,messages,auth.log,secure,kern.log,daemon.log}\"). Braces are alternation, ** recurses, e.g. \"/var/log/{syslog,nginx/*.log}\"."
+		optional = true
+		default  = "/var/log/{syslog,messages,auth.log,secure,kern.log,daemon.log}"
+	}
+	argument "path_exclude" {
+		comment  = "doublestar glob of files to skip (default: rotated and compressed copies). The default `path` cannot match them anyway -- syslog.1 is not syslog -- but a caller-supplied \"/var/log/**\" would."
+		optional = true
+		default  = "/var/log/**/*.{gz,xz,zst,bz2,old,bak,[0-9]}"
+	}
+	argument "tail_from_end" {
+		comment  = "Start at the END of a file the collector has no stored offset for, instead of reading it from the top (default: false). true skips the backlog on first start, at the cost of losing it."
+		optional = true
+		default  = false
+	}
+	argument "timestamp_location" {
+		comment  = "IANA time zone the BSD-syslog timestamps in these files are written in (default: \"Local\", the collector's own zone). BSD syslog carries no zone, so a collector in UTC reading a host that logs in +07:00 would shift every entry by 7 hours."
+		optional = true
+		default  = "Local"
+	}
+	argument "node_name" {
+		comment  = "Value for the node label (default: sys.env(\"K8S_NODE_NAME\"), else the hostname). Under a container runtime WITHOUT host networking the hostname is the container id -- pass this explicitly there."
+		optional = true
+	}
+	argument "job_name" {
+		comment  = "Value for the job label (default: \"integrations/varlogs\")"
+		optional = true
+		default  = "integrations/varlogs"
+	}
+	argument "cluster_name" {
+		comment  = "Value for the cluster_name label (default: \"\", unset)"
+		optional = true
+	}
+	argument "region" {
+		comment  = "Value for the region label (default: \"\", unset)"
+		optional = true
+	}
+	argument "zone" {
+		comment  = "Value for the zone label (default: \"\", unset)"
+		optional = true
+	}
+	// Same contract as host_metrics' external_labels: REPLACES the default set
+	// rather than merging with it, since Alloy has no map-merge function.
+	// Applied as static labels inside the pipeline rather than on loki.write,
+	// so they survive forward_to too.
+	argument "external_labels" {
+		comment  = "Complete map of static labels REPLACING the region/zone/cluster_name defaults (default: unset, which keeps them). Use it to carry the same vocabulary a host's metrics already use, e.g. { environment = \"production\", region = \"eu-west-1\", role = \"database\" }."
+		optional = true
+	}
+
+	// Expand the glob into one target per concrete file, re-checked every
+	// sync_period so rotation and new files are picked up.
+	local.file_match "host" {
+		path_targets = [{
+			"__path__"         = argument.path.value,
+			"__path_exclude__" = argument.path_exclude.value,
+		}]
+	}
+
+	discovery.relabel "host" {
+		targets = local.file_match.host.targets
+
+		// Basename of the file: auth.log, messages, syslog. Bounded by the
+		// glob, and the useful half of the `filename` label that
+		// loki.source.file attaches (which is dropped in the pipeline, being
+		// the full path and therefore redundant). Both separators are matched
+		// because local.file_match reports the platform's own: a backslash
+		// path on Windows would leave log_file empty against a /-only regex.
+		rule {
+			source_labels = ["__path__"]
+			action        = "replace"
+			regex         = ".*[\\\\/]([^\\\\/]+)"
+			replacement   = "$1"
+			target_label  = "log_file"
+		}
+
+		rule {
+			action       = "replace"
+			target_label = "node"
+			replacement  = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"), constants.hostname)
+		}
+
+		rule {
+			action       = "replace"
+			target_label = "job"
+			replacement  = argument.job_name.value
+		}
+	}
+
+	loki.source.file "host" {
+		targets       = discovery.relabel.host.output
+		forward_to    = [loki.process.files.receiver]
+		tail_from_end = argument.tail_from_end.value
+	}
+
+	loki.process "files" {
+		forward_to = coalesce(argument.forward_to.value, [loki.write.default.receiver])
+
+		// The full path, already captured as log_file above.
+		stage.label_drop {
+			values = ["filename"]
+		}
+
+		stage.drop {
+			expression          = "^\\s*$"
+			drop_counter_reason = "empty_line"
+		}
+
+		// BSD syslog (RFC3164), rsyslog's traditional file format:
+		//   "Sep 18 12:34:56 hostname sshd[1234]: Accepted publickey for ..."
+		// The line filter is a cheap pre-selector -- the regex below does the
+		// real parsing -- so it is written without backslash escapes to stay
+		// readable through two layers of quoting.
+		stage.match {
+			selector = `{job=~".+"} |~ "^[A-Z][a-z][a-z] [ 0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] "`
+
+			stage.regex {
+				expression = `^(?P<timestamp>[A-Z][a-z]{2}\s+\d{1,2} \d{2}:\d{2}:\d{2}) (?P<hostname>\S+) (?P<app>[^\s\[:]+)(?:\[(?P<pid>\d+)\])?: ?(?P<message>.*)$`
+			}
+
+			// "Jan _2 15:04:05" is the Go layout for the BSD stamp; with no
+			// year in the format Alloy assumes the current one. skip keeps the
+			// read time when a line only looked like syslog, rather than
+			// fudging it onto the previous entry's timestamp.
+			stage.timestamp {
+				source            = "timestamp"
+				format            = "Jan _2 15:04:05"
+				location          = argument.timestamp_location.value
+				action_on_failure = "skip"
+			}
+
+			stage.labels {
+				values = {
+					app      = "",
+					hostname = "",
+				}
+			}
+
+			// A tag written without a [pid] -- "(sd-pam):" and similar -- leaves
+			// the optional capture group empty, so those entries carry pid="".
+			// Harmless and a few bytes; the alternative is a second pair of
+			// parse blocks for the no-pid case, which is not worth it.
+			stage.structured_metadata {
+				values = {
+					pid = "",
+				}
+			}
+
+			// Drop the syslog header from the line: every field in it is now a
+			// label or structured metadata.
+			stage.output {
+				source = "message"
+			}
+		}
+
+		// rsyslog's RSYSLOG_FileFormat / RFC5424-style line:
+		//   "2026-09-18T12:34:56.123456+07:00 hostname sshd[1234]: msg"
+		// This timestamp carries its own zone, so timestamp_location does not
+		// apply to it.
+		stage.match {
+			selector = `{job=~".+"} |~ "^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]"`
+
+			stage.regex {
+				expression = `^(?P<timestamp>\S+) (?P<hostname>\S+) (?P<app>[^\s\[:]+)(?:\[(?P<pid>\d+)\])?:? ?(?P<message>.*)$`
+			}
+
+			stage.timestamp {
+				source            = "timestamp"
+				format            = "RFC3339Nano"
+				fallback_formats  = ["RFC3339"]
+				action_on_failure = "skip"
+			}
+
+			stage.labels {
+				values = {
+					app      = "",
+					hostname = "",
+				}
+			}
+
+			stage.structured_metadata {
+				values = {
+					pid = "",
+				}
+			}
+
+			stage.output {
+				source = "message"
+			}
+		}
+
+		// Level. Most /var/log files carry no severity at all -- rsyslog
+		// strips the priority before writing -- so the default stands unless
+		// the message itself names a level in JSON or logfmt form
+		// (level=error, "severity":"warn", lvl: info). For anything more
+		// specific, add stages in the loki.process you chain via forward_to.
+		stage.static_labels {
+			values = {
+				level = "unknown",
+			}
+		}
+
+		stage.match {
+			selector = `{level="unknown"} |~ "(?i)(level|lvl|severity).{0,3}(trace|debug|info|warn|warning|error|err|fatal|crit|critical)"`
+
+			stage.regex {
+				expression = `(?i)"?(?:level|lvl|severity)"?\s*[:=]\s*"?(?P<level>trace|debug|info|warn|warning|error|err|fatal|crit|critical)"?`
+			}
+
+			stage.labels {
+				values = {
+					level = "",
+				}
+			}
+
+			// Same vocabulary as the journal and syslog declares.
+			stage.replace {
+				source     = "level"
+				expression = "(?i)^(warning)$"
+				replace    = "warn"
+			}
+
+			stage.replace {
+				source     = "level"
+				expression = "(?i)^(err)$"
+				replace    = "error"
+			}
+
+			stage.replace {
+				source     = "level"
+				expression = "(?i)^(crit)$"
+				replace    = "critical"
+			}
+
+			stage.template {
+				source   = "level"
+				template = "{{ ToLower .Value }}"
+			}
+
+			stage.labels {
+				values = {
+					level = "",
+				}
+			}
+		}
+
+		stage.static_labels {
+			values = coalesce(argument.external_labels.value, {
+				cluster_name = coalesce(argument.cluster_name.value, ""),
+				region       = coalesce(argument.region.value, ""),
+				zone         = coalesce(argument.zone.value, ""),
+			})
+		}
+
+		stage.tenant {
+			value = argument.tenant_id.value
+		}
+	}
+
+	loki.write "default" {
+		endpoint {
+			url = argument.endpoint_url.value
+
+			basic_auth {
+				username = argument.endpoint_basic_auth_username.value
+				password = argument.endpoint_basic_auth_password.value
+			}
+
+			tenant_id = argument.tenant_id.value
+		}
+	}
+}
+
+// host_logs.syslog
+//
+// Receive syslog over the network and ship it to Loki. For hosts and devices
+// that cannot run a collector: network gear, firewalls, storage appliances,
+// and any machine whose rsyslog/syslog-ng already forwards.
+//
+// One instance speaks ONE wire format, because that is a per-listener setting
+// and mixing formats on a port is not decidable. Run it twice when you have
+// both -- modern RFC5424 senders and legacy BSD devices:
+//
+//   host_logs.syslog "rfc5424" { listen_address = "0.0.0.0:514"  ... }
+//   host_logs.syslog "rfc3164" { listen_address = "0.0.0.0:1514"
+//                                syslog_format  = "rfc3164" ... }
+//
+// Each instance opens BOTH tcp and udp on its address. UDP loses messages
+// silently under load and cannot be authenticated; prefer TCP wherever the
+// sender supports it. TCP senders must use RFC6587 octet-counting framing,
+// which is what rsyslog's omfwd does by default.
+//
+// RFC3164 and time zones -- a trap worth spelling out. A BSD timestamp
+// ("Sep 18 12:41:10") carries neither year nor offset. The year is filled in
+// from rfc3164_default_to_current_year below, but the clock is read as UTC,
+// verified by feeding this listener a message from a +07:00 host and getting
+// 12:41:10Z back. A device logging local time in Jakarta therefore arrives
+// stamped seven hours in the FUTURE, and Loki rejects anything past its
+// creation_grace_period (10m by default) -- the logs simply never appear. For
+// legacy senders outside UTC, either set use_incoming_timestamp = false and
+// stamp arrival time, or move the sender to RFC5424, whose timestamps carry
+// the offset.
+//
+// Sender configuration (rsyslog, RFC5424 over TCP):
+//   *.* action(type="omfwd" target="collector.example.com" port="514"
+//              protocol="tcp" template="RSYSLOG_SyslogProtocol23Format")
+//
+// Requirements:
+//   - Reachability: publish the port when the collector runs in a container
+//     (-p 514:514/tcp -p 514:514/udp), and open it in the host firewall.
+//   - Port 514 is privileged. The official Alloy images run as root, so it
+//     binds; under a non-root user either grant CAP_NET_BIND_SERVICE or listen
+//     on a high port and publish 514 to it.
+//
+// Usage:
+//   host_logs.syslog "network" {
+//       tenant_id                    = "my-tenant"
+//       endpoint_url                 = sys.env("LOKI_ENDPOINT_URL")
+//       endpoint_basic_auth_username = sys.env("AUTH_BASIC_USERNAME")
+//       endpoint_basic_auth_password = sys.env("AUTH_BASIC_PASSWORD")
+//       cluster_name                 = sys.env("CLUSTER_NAME")
+//   }
+declare "syslog" {
+	// -- Required -----------------------------------------------------------
+	argument "tenant_id" {
+		comment = "The Loki tenant (X-Scope-OrgID) to stamp on received logs. For per-sender tenants, chain forward_to into your own loki.process and use stage.tenant with a label there."
+	}
+
+	// -- Delivery: embedded writer, or forward_to ---------------------------
+	argument "forward_to" {
+		comment  = "list(LogsReceiver) to send logs to INSTEAD of the embedded loki.write (default: unset, use the embedded writer)"
+		optional = true
+	}
+	argument "endpoint_url" {
+		comment  = "Loki push URL for the embedded writer. Required unless forward_to is set."
+		optional = true
+		default  = "http://localhost:3100/loki/api/v1/push"
+	}
+	argument "endpoint_basic_auth_username" {
+		comment  = "Basic-auth username for the embedded writer (default: \"\", no credentials)"
+		optional = true
+		default  = ""
+	}
+	argument "endpoint_basic_auth_password" {
+		comment  = "Basic-auth password for the embedded writer (default: \"\", no credentials)"
+		optional = true
+		default  = ""
+	}
+
+	// -- Optional -----------------------------------------------------------
+	argument "listen_address" {
+		comment  = "host:port to listen on, for both tcp and udp (default: \"0.0.0.0:514\"). 0.0.0.0 is required to accept from other machines -- 127.0.0.1 accepts nothing but the collector's own host."
+		optional = true
+		default  = "0.0.0.0:514"
+	}
+	argument "syslog_format" {
+		comment  = "Wire format this listener parses: \"rfc5424\" (default) or \"rfc3164\" (legacy BSD). A sender using the other format produces parse errors, counted by loki_source_syslog_parsing_errors_total."
+		optional = true
+		default  = "rfc5424"
+	}
+	argument "use_incoming_timestamp" {
+		comment  = "Use the timestamp in the message instead of the time it arrived (default: true). A sender with a badly wrong clock then produces entries Loki may reject as too old or too far in the future -- set false to stamp arrival time for a fleet with unreliable clocks."
+		optional = true
+		default  = true
+	}
+	argument "max_message_length" {
+		comment  = "Longest message accepted, in bytes (default: 8192). Longer messages are truncated; raise it for senders that ship stack traces."
+		optional = true
+		default  = 8192
+	}
+	argument "idle_timeout" {
+		comment  = "How long an idle TCP connection is held open (default: \"120s\")"
+		optional = true
+		default  = "120s"
+	}
+	argument "label_structured_data" {
+		comment  = "Turn RFC5424 structured data into labels (default: false). Senders control those keys, so this hands label cardinality to them -- leave it off unless you know the senders."
+		optional = true
+		default  = false
+	}
+	argument "job_name" {
+		comment  = "Value for the job label (default: \"integrations/syslog\")"
+		optional = true
+		default  = "integrations/syslog"
+	}
+	argument "cluster_name" {
+		comment  = "Value for the cluster_name label (default: \"\", unset)"
+		optional = true
+	}
+	argument "region" {
+		comment  = "Value for the region label (default: \"\", unset)"
+		optional = true
+	}
+	argument "zone" {
+		comment  = "Value for the zone label (default: \"\", unset)"
+		optional = true
+	}
+	// Same contract as host_metrics' external_labels: REPLACES the default set
+	// rather than merging with it, since Alloy has no map-merge function.
+	// Applied as static labels inside the pipeline rather than on loki.write,
+	// so they survive forward_to too.
+	argument "external_labels" {
+		comment  = "Complete map of static labels REPLACING the region/zone/cluster_name defaults (default: unset, which keeps them). Use it to carry the same vocabulary a host's metrics already use, e.g. { environment = \"production\", region = \"eu-west-1\", role = \"database\" }."
+		optional = true
+	}
+
+	loki.source.syslog "host" {
+		forward_to    = [loki.process.syslog.receiver]
+		relabel_rules = loki.relabel.syslog.rules
+
+		listener {
+			address  = argument.listen_address.value
+			protocol = "tcp"
+
+			syslog_format          = argument.syslog_format.value
+			use_incoming_timestamp = argument.use_incoming_timestamp.value
+			max_message_length     = argument.max_message_length.value
+			idle_timeout           = argument.idle_timeout.value
+			label_structured_data  = argument.label_structured_data.value
+
+			// RFC3164 timestamps carry no year; without this they parse to
+			// year 0 and Loki rejects them. Ignored for rfc5424, whose
+			// timestamps are complete.
+			rfc3164_default_to_current_year = true
+
+			// false keeps the line as the message alone. true would prepend
+			// the whole RFC5424 header, every field of which is a label below.
+			use_rfc5424_message = false
+
+			labels = {
+				protocol = "tcp",
+			}
+		}
+
+		listener {
+			address  = argument.listen_address.value
+			protocol = "udp"
+
+			syslog_format          = argument.syslog_format.value
+			use_incoming_timestamp = argument.use_incoming_timestamp.value
+			max_message_length     = argument.max_message_length.value
+			label_structured_data  = argument.label_structured_data.value
+
+			rfc3164_default_to_current_year = true
+			use_rfc5424_message             = false
+
+			labels = {
+				protocol = "udp",
+			}
+		}
+	}
+
+	// Syslog fields reach relabeling as __syslog_message_* (parsed from the
+	// message) and __syslog_connection_* (observed from the connection). Every
+	// __-prefixed label is dropped before forwarding, so anything worth
+	// keeping is copied onto a real name here.
+	loki.relabel "syslog" {
+		forward_to = []
+
+		// node is the SENDER, keeping the label meaning the same as in the
+		// journal and files declares. Prefer the hostname the sender put in
+		// the message; fall back to the reverse-DNS name of the connection,
+		// then to its IP, so an appliance that sends no HOSTNAME is still
+		// attributable. Each fallback only fires when the previous left node
+		// empty -- "^;(.+)$" matches nothing before the separator.
+		rule {
+			source_labels = ["__syslog_message_hostname"]
+			action        = "replace"
+			target_label  = "node"
+		}
+
+		rule {
+			source_labels = ["node", "__syslog_connection_hostname"]
+			action        = "replace"
+			separator     = ";"
+			regex         = "^;(.+)$"
+			replacement   = "$1"
+			target_label  = "node"
+		}
+
+		rule {
+			source_labels = ["node", "__syslog_connection_ip_address"]
+			action        = "replace"
+			separator     = ";"
+			regex         = "^;(.+)$"
+			replacement   = "$1"
+			target_label  = "node"
+		}
+
+		rule {
+			source_labels = ["__syslog_message_app_name"]
+			action        = "replace"
+			target_label  = "app"
+		}
+
+		// daemon, auth, authpriv, cron, kern, local0-7: bounded, and the
+		// dimension most syslog dashboards slice on.
+		rule {
+			source_labels = ["__syslog_message_facility"]
+			action        = "replace"
+			target_label  = "facility"
+		}
+
+		// Severity arrives as a name, and that name is the RFC 5424 LONG form:
+		// emergency, alert, critical, error, warning, notice, informational,
+		// debug -- confirmed by feeding this listener one message per
+		// severity. informational is the one that matters: it is the severity
+		// of most syslog traffic, and left alone it would ship a level value
+		// no dashboard selects. critical, error and debug already match our
+		// vocabulary and need no rule.
+		//
+		// The short forms (emerg, crit, err) are folded as well. They are what
+		// journald's priority keywords use, so covering both here means the
+		// two declares cannot drift apart if a future Alloy switches the
+		// parser's vocabulary. Relabel regexes are fully anchored, so "crit"
+		// never matches the "critical" a previous rule produced.
+		rule {
+			source_labels = ["__syslog_message_severity"]
+			action        = "replace"
+			target_label  = "level"
+		}
+
+		rule {
+			source_labels = ["level"]
+			action        = "replace"
+			regex         = "emergency|emerg"
+			replacement   = "fatal"
+			target_label  = "level"
+		}
+
+		rule {
+			source_labels = ["level"]
+			action        = "replace"
+			regex         = "alert|crit"
+			replacement   = "critical"
+			target_label  = "level"
+		}
+
+		rule {
+			source_labels = ["level"]
+			action        = "replace"
+			regex         = "err"
+			replacement   = "error"
+			target_label  = "level"
+		}
+
+		rule {
+			source_labels = ["level"]
+			action        = "replace"
+			regex         = "warning"
+			replacement   = "warn"
+			target_label  = "level"
+		}
+
+		rule {
+			source_labels = ["level"]
+			action        = "replace"
+			regex         = "notice|informational"
+			replacement   = "info"
+			target_label  = "level"
+		}
+
+		// Set as labels so the pipeline can see them, then demoted to
+		// structured metadata below.
+		rule {
+			source_labels = ["__syslog_message_proc_id"]
+			action        = "replace"
+			target_label  = "pid"
+		}
+
+		rule {
+			source_labels = ["__syslog_message_msg_id"]
+			action        = "replace"
+			target_label  = "msg_id"
+		}
+
+		// Kept separately from node: when node came from the message, this is
+		// the only record of which address actually delivered it -- the
+		// forwarder in front, or a spoofed sender.
+		rule {
+			source_labels = ["__syslog_connection_ip_address"]
+			action        = "replace"
+			target_label  = "remote_ip"
+		}
+
+		rule {
+			action       = "replace"
+			target_label = "job"
+			replacement  = argument.job_name.value
+		}
+	}
+
+	loki.process "syslog" {
+		forward_to = coalesce(argument.forward_to.value, [loki.write.default.receiver])
+
+		stage.static_labels {
+			values = coalesce(argument.external_labels.value, {
+				cluster_name = coalesce(argument.cluster_name.value, ""),
+				region       = coalesce(argument.region.value, ""),
+				zone         = coalesce(argument.zone.value, ""),
+			})
+		}
+
+		stage.structured_metadata {
+			values = {
+				pid       = "",
+				msg_id    = "",
+				remote_ip = "",
+			}
+		}
+
+		stage.tenant {
+			value = argument.tenant_id.value
+		}
+	}
+
+	loki.write "default" {
+		endpoint {
+			url = argument.endpoint_url.value
+
+			basic_auth {
+				username = argument.endpoint_basic_auth_username.value
+				password = argument.endpoint_basic_auth_password.value
+			}
+
+			tenant_id = argument.tenant_id.value
+		}
+	}
+}
