@@ -39,6 +39,31 @@
 // in kubernetes.io/metadata.name label (present on every namespace) against this
 // tenant's namespace list.
 //
+// CRITICAL -- namespace_prefix MUST be unique per cluster when a tenant is
+// shared. mimir.rules.kubernetes and loki.rules.kubernetes do not merely push
+// rules: each one OWNS a prefix in the ruler and reconciles the whole thing,
+// DELETING every rule namespace under that prefix it does not find in its own
+// Kubernetes view. The Alloy default prefix is "alloy" for both. So if two
+// clusters sync to one tenant and both keep the default, each deletes the
+// other's rules on every sync_interval, forever, and neither logs an error --
+// every request returns 200/202.
+//
+// Observed on a shared tenant 2026-09-20: three clusters rotating through
+// the same prefix, polled once a minute --
+//   13:17  groups=3  cluster-health-alloy/e66912a8   (cluster A)
+//   13:18  groups=1  alloy-self-recording/ff89472c   (cluster B, A wiped)
+//   13:19  groups=1  alloy-self-recording/3c4846be   (cluster C, B wiped)
+//   13:22  groups=3  cluster-health-alloy/e66912a8   (A again)
+// Each cluster's rules existed roughly one minute in five. Worse than the
+// downtime: a group is deleted and recreated every few minutes, so alert "for:"
+// state resets each cycle and an alert with for: 10m can NEVER reach firing. It
+// looks like working alerting right up until you need it.
+//
+// Pick a prefix that is not a prefix of any other cluster's. The cluster name
+// alone is the safe choice. Do NOT use "alloy/<cluster>" or "alloy-<cluster>":
+// depending on how the component matches its prefix, a cluster still running
+// the bare "alloy" default may claim those as its own and delete them.
+//
 // Requirements:
 //   - RBAC: get/list/watch on the PrometheusRule CRD and namespaces.
 //   - A reachable Mimir ruler (for .metrics) and/or Loki ruler (for .logs).
@@ -50,6 +75,7 @@
 //       ruler_endpoint               = sys.env("MIMIR_ENDPOINT")
 //       endpoint_basic_auth_username = sys.env("AUTH_BASIC_USERNAME")
 //       endpoint_basic_auth_password = sys.env("AUTH_BASIC_PASSWORD")
+//       namespace_prefix             = sys.env("CLUSTER_NAME")
 //   }
 //   k8s_alert.logs "my_tenant" {
 //       namespaces                   = ["my-namespace"]
@@ -57,6 +83,7 @@
 //       ruler_endpoint               = sys.env("LOKI_ENDPOINT")
 //       endpoint_basic_auth_username = sys.env("AUTH_BASIC_USERNAME")
 //       endpoint_basic_auth_password = sys.env("AUTH_BASIC_PASSWORD")
+//       namespace_prefix             = sys.env("CLUSTER_NAME")
 //   }
 // metrics and logs are split into two independent declares (rather than one
 // that hardcodes both rulers) so a caller instantiates ONLY the backends it
@@ -91,12 +118,22 @@ declare "metrics" {
 		comment  = "How often to reconcile CRDs into the ruler (default: \"5m\")"
 		optional = true
 	}
+	argument "namespace_prefix" {
+		comment  = "Ruler namespace prefix this cluster OWNS and prunes (default: \"alloy\"). MUST be unique per cluster on a shared tenant -- see the header; the default deletes other clusters' rules. Use the cluster name."
+		optional = true
+	}
 
 	mimir.rules.kubernetes "metrics" {
 		address   = argument.ruler_endpoint.value
 		tenant_id = argument.tenant_id.value
 
 		sync_interval = coalesce(argument.sync_interval.value, "5m")
+
+		// Everything under this prefix is reconciled against THIS cluster's
+		// PrometheusRule CRDs -- anything else found there is deleted. Defaults
+		// to Alloy's own "alloy", which is safe only when this cluster is the
+		// sole writer to the tenant.
+		mimir_namespace_prefix = coalesce(argument.namespace_prefix.value, "alloy")
 
 		basic_auth {
 			username = argument.endpoint_basic_auth_username.value
@@ -155,12 +192,20 @@ declare "logs" {
 		comment  = "How often to reconcile CRDs into the ruler (default: \"5m\")"
 		optional = true
 	}
+	argument "namespace_prefix" {
+		comment  = "Ruler namespace prefix this cluster OWNS and prunes (default: \"alloy\"). MUST be unique per cluster on a shared tenant -- see the header; the default deletes other clusters' rules. Use the cluster name."
+		optional = true
+	}
 
 	loki.rules.kubernetes "logs" {
 		address   = argument.ruler_endpoint.value
 		tenant_id = argument.tenant_id.value
 
 		sync_interval = coalesce(argument.sync_interval.value, "5m")
+
+		// Same ownership semantics as the Mimir declare above: this prefix is
+		// reconciled against THIS cluster's CRDs and pruned of anything else.
+		loki_namespace_prefix = coalesce(argument.namespace_prefix.value, "alloy")
 
 		basic_auth {
 			username = argument.endpoint_basic_auth_username.value
