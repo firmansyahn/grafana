@@ -132,7 +132,18 @@ declare "unix" {
 			// container -- 11 of them, churning on every restart -- plus
 			// Podman's bind of graphroot/overlay onto itself, which reports
 			// the same device as /var and would double-count its capacity.
-			mount_points_exclude = "^/(dev|proc|sys|var/lib/docker/.+|var/lib/containers/storage/.+|var/lib/kubelet/.+|run/containerd/.+|run/containers/storage/.+|run/credentials/.+|run/user/[0-9]+/containers/.+|.+/\\.local/share/containers/storage/.+)($|/)"
+			// On ostree hosts (Fedora CoreOS, RHCOS) the root partition is mounted
+			// four times -- /sysroot, /var, /etc and /sysroot/ostree/deploy/<os>/var
+			// -- so a single filesystem emits four identical node_filesystem_*
+			// series and every filesystem alert fires four times per node. Checked
+			// on a Fedora CoreOS 44 node: /dev/sda4 reports at all four, each with
+			// the same 106769133568 size, and there is no "/" mountpoint at all.
+			// Keep /var, which is what dashboards and alerts reference, and drop
+			// the other three; root capacity stays visible through /var. /boot is a
+			// separate partition (/dev/sda3) and is untouched. Non-ostree hosts have
+			// no /sysroot, and their /etc is part of / rather than its own mount, so
+			// this changes nothing for them.
+			mount_points_exclude = "^/(dev|proc|sys|sysroot|etc|var/lib/docker/.+|var/lib/containers/storage/.+|var/lib/kubelet/.+|run/containerd/.+|run/containers/storage/.+|run/credentials/.+|run/user/[0-9]+/containers/.+|.+/\\.local/share/containers/storage/.+)($|/)"
 			// mount_points_exclude = "^/(dev|proc|sys|var/lib/docker/.+|var/lib/kubelet/.+|run/containerd/io\.containerd\.grpc\.v1\.cri/sandboxes/[a-f0-9]{64}/shm)($|/)"
 			fs_types_exclude     = "^(autofs|binfmt_misc|bpf|cgroup2?|configfs|debugfs|devpts|devtmpfs|fusectl|hugetlbfs|iso9660|mqueue|nsfs|overlay|proc|procfs|pstore|rpc_pipefs|securityfs|selinuxfs|squashfs|sysfs|tracefs)$"
 		}
