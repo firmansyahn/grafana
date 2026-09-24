@@ -1,3 +1,27 @@
+// k8s_events
+//
+// Kubernetes events as log lines. loki.source.kubernetes_events watches the
+// API server for the events of every namespace and ships each one as a line,
+// in JSON (the default) or logfmt. The pipeline parses either format, turns
+// the event's type, reason, object kind, reporting component and node into
+// labels, and drops Normal events unless drop_normal_events = false.
+//
+// Safe on every pod of a clustered DaemonSet: with Alloy clustering the peers
+// pick one of them to watch the events, so each event is shipped once.
+// Without clustering, every Alloy that runs this ships every event.
+//
+// Labels:
+//   job        integrations/kubernetes/eventhandler, or job_label
+//   instance   the ID of the source component
+//   namespace  the namespace of the object the event is about (none for
+//              cluster-scoped objects such as nodes)
+//   type       Normal or Warning
+//   reason     e.g. BackOff, FailedScheduling, Unhealthy
+//   kind       the object's kind, e.g. Pod, Node
+//   source     the component that reported it, e.g. kubelet, default-scheduler
+//   node       the node it was reported from, when there is one
+//   cluster_name
+// The line keeps the rest: the object's name, the message (msg), the count.
 declare "kubernetes" {
 	argument "cluster_name" { }
 
@@ -6,116 +30,94 @@ declare "kubernetes" {
 	}
 
 	argument "job_label" {
-		comment  = "The job label to add for all cadvisor metric (default: integrations/kubernetes/eventhandler)"
+		comment  = "The job label of the event streams (default: integrations/kubernetes/eventhandler)"
 		optional = true
 	}
 
 	argument "log_format" {
-		comment  = " (default: json)"
+		comment  = "Line format of each event, \"json\" or \"logfmt\" (default: \"json\")"
 		optional = true
 	}
 
 	argument "tenant_id" { }
 
 	argument "drop_normal_events" {
+		comment  = "Drop events of type Normal, keeping Warning ones only (default: true)"
 		default  = true
 		optional = true
 	}
 
 	loki.source.kubernetes_events "cluster_events" {
 		job_name   = coalesce(argument.job_label.value, "integrations/kubernetes/eventhandler")
-		log_format = coalesce(argument.job_label.value, "json")
+		log_format = coalesce(argument.log_format.value, "json")
 		forward_to = [
 			loki.process.cluster_events.receiver,
 		]
+
+		// Watching all namespaces is a single clustering key, so exactly one
+		// peer owns it.
+		clustering {
+			enabled = true
+		}
 	}
 
 	loki.process "cluster_events" {
 		forward_to = argument.forward_to.value
 
+		// Parse by the line's own format, since log_format can pick either.
+		// The field names are the ones loki.source.kubernetes_events writes,
+		// the same in both formats.
 		stage.match {
-			selector      = "{job=\"integrations/kubernetes/eventhandler\"}"
-			pipeline_name = "try_json"
+			selector      = `{job=~".+"} |~ "^[{]"`
+			pipeline_name = "json"
 
 			stage.json {
 				expressions = {
-					reason        = "reason",
-					message       = "message",
-					type          = "type",
-					namespace     = "metadata.namespace",
-					name          = "metadata.name",
-					uid           = "metadata.uid",
-					creation_ts   = "metadata.creationTimestamp",
-					involved_kind = "involvedObject.kind",
-					involved_name = "involvedObject.name",
-					involved_ns   = "involvedObject.namespace",
-					involved_uid  = "involvedObject.uid",
-					source        = "source.component",
-					node          = "source.host",
-					reporting     = "reportingComponent",
-					count         = "count",
+					type   = "type",
+					reason = "reason",
+					kind   = "kind",
+					source = "sourcecomponent",
+					node   = "sourcehost",
 				}
 			}
 		}
 
-		//stage.logfmt {
-		//    mapping = {
-		//        type      = "type",
-		//        reason    = "reason",
-		//        namespace = "namespace",
-		//        kind      = "kind",
-		//        source    = "sourcecomponent",
-		//        node      = "name",
-		//        message   = "msg",
-		//        count     = "count",
-		//    }
-		//}
-
 		stage.match {
-			selector            = "{type=\"Normal\"}"
-			action              = "drop"
-			drop_counter_reason = "normal_events"
-		}
+			selector      = `{job=~".+"} !~ "^[{]"`
+			pipeline_name = "logfmt"
 
-		stage.template {
-			source   = "severity"
-			template = "{{`{{`}} if eq .type \"Warning\" {{`}}`}}warning{{`{{`}} else {{`}}`}}info{{`{{`}} end {{`}}`}}"
-		}
-
-		stage.template {
-			source   = "incident"
-			template = "{{`{{`}} if eq .reason \"BackOff\" {{`}}`}}crashloop{{`{{`}} else if or (eq .reason \"NodeNotReady\") (eq .reason \"NodeHasDiskPressure\") (eq .reason \"NodeHasMemoryPressure\") {{`}}`}}node-pressure{{`{{`}} else }}none{{`{{`}} end {{`}}`}}"
-		}
-
-		stage.template {
-			source   = "alert_group"
-			template = "{{`{{`}} .namespace {{`}}`}}-{{`{{`}} .reason {{`}}`}}"
-		}
-
-		stage.template {
-			source   = "log"
-			template = "{{`{{`}} .creation_ts {{`}}`}} [{{`{{`}} .severity | upper {{`}}`}}] {{`{{`}} .namespace }}/{{`{{`}} .involved_kind {{`}}`}}: {{`{{`}} .reason {{`}}`}} - {{`{{`}} .message {{`}}`}}"
-		}
-
-		// Promote extracted fields to labels
-		stage.labels {
-			values = {
-				type      = "type",   // Normal or Warning
-				reason    = "reason", // e.g. BackOff, Pulled, Scheduled
-				namespace = "involved_ns",
-				kind      = "involved_kind", // e.g. Pod, Deployment
-				source    = "source",        // e.g. kubelet, default-scheduler
-				node      = "node",
+			stage.logfmt {
+				mapping = {
+					type   = "",
+					reason = "",
+					kind   = "",
+					source = "sourcecomponent",
+					node   = "sourcehost",
+				}
 			}
 		}
 
-		stage.label_drop {
-			values = [
-				"uid",
-				"name",
-				"involved_uid",
-				"involved_name",
-			]
+		stage.labels {
+			values = {
+				type   = "", // Normal or Warning
+				reason = "", // e.g. BackOff, Pulled, Scheduled
+				kind   = "", // e.g. Pod, Deployment
+				source = "", // e.g. kubelet, default-scheduler
+				node   = "",
+			}
+		}
+
+		// After stage.labels: a selector matches labels, not extracted fields.
+		// The "false" branch selects a label no entry carries, a valid selector
+		// that matches nothing, since Alloy has no conditional blocks.
+		stage.match {
+			selector = {
+				"true"  = `{type="Normal"}`,
+				"false" = `{k8s_events_never_matches="1"}`,
+			}[string.format("%t", argument.drop_normal_events.value)]
+
+			action              = "drop"
+			drop_counter_reason = "normal_events"
 		}
 
 		stage.static_labels {
