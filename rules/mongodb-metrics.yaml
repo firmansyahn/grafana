@@ -1,0 +1,325 @@
+# mongodb-metrics -- alerting rules for the MongoDB processes that
+# alloy/modules/mongodb_metrics.alloy scrapes: standalone mongod, replica set
+# members, and the shard members, config server members and mongos routers of
+# a sharded cluster.
+#
+# A Prometheus Operator PrometheusRule. Applied to a tenant's namespace, it is
+# synced into that tenant's Mimir ruler by alloy/modules/k8s_alert.alloy (it has
+# no grafana.com/rules-type label, so it goes to Mimir only). The rules have to
+# land in the tenant the metrics are written to. Without Kubernetes, load the
+# same groups with mimirtool:
+#
+#   yq '{"namespace": .metadata.name, "groups": .spec.groups}' \
+#     rules/mongodb-metrics.yaml > mongodb-metrics.rules.yaml
+#   mimirtool rules load mongodb-metrics.rules.yaml --address=<mimir> --id=<tenant>
+#
+# (plus --user and --key when Mimir sits behind basic auth). Loading rules only
+# evaluates them: the tenant's Alertmanager still needs a route that delivers
+# them somewhere.
+#
+# Selectors. Rules select by metric name, not by the module's job name
+# (integrations/mongodb), so they also cover a MongoDB scraped some other way,
+# such as a standalone mongodb_exporter run with --compatible-mode (the module
+# turns compatible mode on by default; a few rules use its metric names). The
+# target rules match any job whose name contains "mongo".
+#
+# Labels. A rule about one process keeps every label of the series it is built
+# on, external labels included, so it routes like everything else from that
+# host. The replica set rules aggregate by (cluster_name, rs_nm), so a replica
+# set name must be unique within a tenant -- rs0 in two clusters, say -- or
+# cluster_name must differ. Otherwise two replica sets read as one, and one's
+# primary hides the other's missing one.
+#
+# Node-local scraping. Each process is scraped by the Alloy on its own node, so
+# a node that dies takes its scraper with it: its series stop, rather than
+# report mongodb_up == 0. MongoDBTargetMissing catches that by remembering every
+# target that reported in the last 7 days.
+#
+# Severity: critical means clients are failing, or will on the next fault;
+# warning means degraded, act within hours; info is worth knowing.
+#
+# Checked with promtool check rules, and promtool test rules with a firing case
+# for every rule plus the non-firing ones that matter: a replica set whose
+# primary only another member can see, a member that is down (which the health
+# rule reports, not the state rule), a job renamed on one instance, user
+# asserts, a balancer that only one router reports. The tests are in
+# tests/mongodb-metrics.test.yaml; rules/test.sh runs both. Every expression
+# was also evaluated against a live sharded cluster (MongoDB 8.2, config server
+# members and mongos routers) scraped by the module.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: mongodb-metrics
+spec:
+  groups:
+    - name: mongodb-metrics.targets
+      rules:
+        # The embedded exporter answers its scrape even when it cannot reach
+        # MongoDB, so a MongoDB that is down shows here, not as up == 0.
+        - alert: MongoDBDown
+          expr: mongodb_up == 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "MongoDB on {{ $labels.instance }} is down or refuses the exporter"
+            description: >-
+              For 2 minutes the exporter has not been able to connect and
+              authenticate to {{ $labels.instance }}: the process is down or not
+              accepting connections, or it rejects the monitoring user (TLS,
+              credentials, or a user that does not exist on that process -- a shard
+              member of a sharded cluster needs a shard-local one). The Alloy log
+              has the exporter's error.
+
+        - alert: MongoDBTargetDown
+          expr: up{job=~".*mongo.*"} == 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $labels.job }} on {{ $labels.instance }} is failing its scrapes"
+            description: >-
+              The scrape of {{ $labels.job }} on {{ $labels.instance }} has failed
+              for 5 minutes. With the module's embedded exporter that points at
+              Alloy itself; with a separate mongodb_exporter, at the exporter being
+              down or unreachable.
+
+        # Targets that reported at some point in the last 7 days but not now.
+        # Matched on instance alone so a renamed job does not look like a
+        # missing target; the 1h subquery step keeps the 7-day look-back cheap.
+        - alert: MongoDBTargetMissing
+          expr: |
+            group by (job, instance) (last_over_time(up{job=~".*mongo.*"}[7d:1h]))
+            unless on (instance)
+            up{job=~".*mongo.*"}
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $labels.job }} on {{ $labels.instance }} has stopped reporting"
+            description: >-
+              Nothing from {{ $labels.job }} on {{ $labels.instance }} for 10
+              minutes, although it reported within the last 7 days. The node is
+              down, or the Alloy that scrapes it is. A target removed or renamed on
+              purpose keeps this firing for up to 7 days; silence it.
+
+    - name: mongodb-metrics.replication
+      rules:
+        # Every member reports the state of every member it can see, so the
+        # replica set has a primary as long as any reporting member sees one --
+        # even one whose own exporter is failing.
+        - alert: MongoDBReplicaSetNoPrimary
+          expr: max by (cluster_name, rs_nm) (mongodb_rs_members_state == bool 1) == 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Replica set {{ $labels.rs_nm }} has no primary"
+            description: >-
+              No reporting member of {{ $labels.rs_nm }} has seen a PRIMARY for a
+              minute, so writes to it fail -- for a shard, writes to the data it
+              owns; for the config servers, chunk migrations and metadata changes.
+              An election normally ends within seconds: check that a majority of
+              the voting members is up and can reach the others.
+
+        # A member counts as unreachable as soon as any member fails its
+        # heartbeats to it.
+        - alert: MongoDBReplicaSetMemberUnhealthy
+          expr: min by (cluster_name, rs_nm, member_idx) (mongodb_rs_members_health) == 0
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $labels.member_idx }} in replica set {{ $labels.rs_nm }} is unreachable"
+            description: >-
+              A member of {{ $labels.rs_nm }} has failed its heartbeats to
+              {{ $labels.member_idx }} for 2 minutes: that process is down, or the
+              network between them is. The replica set keeps its primary while a
+              majority of the voting members can reach each other; one more loss
+              may take it away.
+
+        # States other than PRIMARY (1), SECONDARY (2), ARBITER (7) and DOWN (8),
+        # which MongoDBReplicaSetMemberUnhealthy reports: STARTUP, RECOVERING,
+        # STARTUP2 (initial sync), UNKNOWN, ROLLBACK, REMOVED.
+        - alert: MongoDBReplicaSetMemberStateAbnormal
+          expr: max by (cluster_name, rs_nm, member_idx, member_state) (mongodb_rs_members_state != 1 != 2 != 7 != 8)
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $labels.member_idx }} in replica set {{ $labels.rs_nm }} is {{ $labels.member_state }}"
+            description: >-
+              {{ $labels.member_idx }} has been {{ $labels.member_state }} for 5
+              minutes, so it serves no reads and cannot become primary. STARTUP2 is an
+              initial sync, which takes as long as copying the data; RECOVERING
+              usually means it fell off the end of the oplog and needs a resync; a
+              ROLLBACK undoes writes that never reached a majority. Its mongod log
+              says which.
+
+        - alert: MongoDBReplicationLagging
+          expr: max by (cluster_name, set, name) (mongodb_mongod_replset_member_replication_lag) > 10
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $labels.name }} is {{ $value | humanizeDuration }} behind the primary of {{ $labels.set }}"
+            description: >-
+              For 5 minutes {{ $labels.name }} has been more than 10 seconds behind
+              the primary of {{ $labels.set }}. Reads from it are stale, writes with a
+              majority write concern wait for it when too few members keep up, and
+              it cannot be elected until it catches up. A slow disk, an overloaded
+              secondary or a flood of writes are the usual causes.
+
+        # An election raises the term by one. Fires for 10 minutes after the
+        # term rises past its own recent maximum.
+        - alert: MongoDBReplicaSetElection
+          expr: |
+            max by (cluster_name, rs_nm) (mongodb_rs_term)
+              > max by (cluster_name, rs_nm) (max_over_time(mongodb_rs_term[1h] offset 10m))
+          labels:
+            severity: warning
+          annotations:
+            summary: "Replica set {{ $labels.rs_nm }} held an election"
+            description: >-
+              {{ $labels.rs_nm }} moved to term {{ $value }} within the last 10
+              minutes: a primary stepped down, failed, or lost touch with a
+              majority. A planned stepdown needs no action; for an unplanned one,
+              find the cause in the old primary's mongod log.
+
+        # The oplog window: how long a member can be away and still catch up
+        # from the oplog instead of resyncing all of its data.
+        - alert: MongoDBOplogWindowShort
+          expr: mongodb_mongod_replset_oplog_head_timestamp - mongodb_mongod_replset_oplog_tail_timestamp < 86400
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: "The oplog on {{ $labels.instance }} holds only {{ $value | humanizeDuration }}"
+            description: >-
+              The oplog on {{ $labels.instance }} spans {{ $value | humanizeDuration }}
+              of writes. A member away for longer than that -- down for maintenance,
+              say -- cannot catch up and has to resync all of its data. Grow the
+              oplog (replSetResizeOplog) or set a minimum retention period.
+        - alert: MongoDBOplogWindowShort
+          expr: mongodb_mongod_replset_oplog_head_timestamp - mongodb_mongod_replset_oplog_tail_timestamp < 3600
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: "The oplog on {{ $labels.instance }} holds only {{ $value | humanizeDuration }}"
+            description: >-
+              The oplog on {{ $labels.instance }} spans {{ $value | humanizeDuration }}
+              of writes. A member away for longer than that -- down for maintenance,
+              say -- cannot catch up and has to resync all of its data. Grow the
+              oplog (replSetResizeOplog) or set a minimum retention period.
+
+    - name: mongodb-metrics.resources
+      rules:
+        # available is what is left of the limit (net.maxIncomingConnections,
+        # or what the open-files limit allows), so current + available is the
+        # limit itself.
+        - alert: MongoDBConnectionsNearLimit
+          expr: |
+            mongodb_connections{state="current"}
+              / ignoring (state)
+            (mongodb_connections{state="current"} + ignoring (state) mongodb_connections{state="available"})
+              > 0.8
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "MongoDB on {{ $labels.instance }} is using {{ $value | humanizePercentage }} of its connections"
+            description: >-
+              At its connection limit MongoDB refuses new connections. Find the
+              client holding the most (db.currentOp or the connection log lines)
+              and check its connection pool size.
+        - alert: MongoDBConnectionsNearLimit
+          expr: |
+            mongodb_connections{state="current"}
+              / ignoring (state)
+            (mongodb_connections{state="current"} + ignoring (state) mongodb_connections{state="available"})
+              > 0.95
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "MongoDB on {{ $labels.instance }} is using {{ $value | humanizePercentage }} of its connections"
+            description: >-
+              At its connection limit MongoDB refuses new connections. Find the
+              client holding the most (db.currentOp or the connection log lines)
+              and check its connection pool size.
+
+        # Read and write tickets bound how many operations run in the storage
+        # engine at once; the rest queue.
+        - alert: MongoDBTicketsExhausted
+          expr: mongodb_mongod_wiredtiger_concurrent_transactions_available_tickets == 0
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "MongoDB on {{ $labels.instance }} has no {{ $labels.txn_rw }} tickets left"
+            description: >-
+              For 2 minutes every {{ $labels.txn_rw }} ticket on
+              {{ $labels.instance }} has been in use, so further operations queue
+              and latency climbs. Usually slow operations hold them: look for
+              collection scans and long operations in db.currentOp, and at the disk
+              under the data directory.
+
+        # WiredTiger starts making application threads evict dirty pages at 20%
+        # of the cache (eviction_dirty_trigger), which operations feel as latency.
+        - alert: MongoDBCacheDirtyHigh
+          expr: mongodb_ss_wt_cache_tracked_dirty_bytes_in_the_cache / mongodb_ss_wt_cache_maximum_bytes_configured > 0.2
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Dirty data fills {{ $value | humanizePercentage }} of the WiredTiger cache on {{ $labels.instance }}"
+            description: >-
+              Above 20% dirty, WiredTiger has application threads evict pages
+              themselves, which slows every write. The disk cannot keep up with the
+              write load: check its latency and the checkpoint durations.
+
+        # And at 95% of the cache overall (eviction_trigger).
+        - alert: MongoDBCacheFull
+          expr: mongodb_ss_wt_cache_bytes_currently_in_the_cache / mongodb_ss_wt_cache_maximum_bytes_configured > 0.95
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "The WiredTiger cache on {{ $labels.instance }} is {{ $value | humanizePercentage }} full"
+            description: >-
+              Above 95% WiredTiger has application threads evict pages, which
+              slows reads and writes alike. The working set no longer fits the
+              cache: give mongod more memory (the cache defaults to half of RAM
+              minus 1 GB, or of the container's limit), or make the queries touch
+              less data.
+
+        # Regular asserts are internal errors; user asserts (bad queries,
+        # duplicate keys) are the applications' and are left out.
+        - alert: MongoDBRegularAsserts
+          expr: increase(mongodb_asserts_total{type="regular"}[5m]) > 0
+          for: 1m
+          labels:
+            severity: warning
+          annotations:
+            summary: "MongoDB on {{ $labels.instance }} raised regular asserts"
+            description: >-
+              {{ $labels.instance }} raised {{ $value | humanize }} regular asserts
+              in 5 minutes: internal errors, which point at a server problem rather
+              than at a client. Its mongod log records each with a stack trace.
+
+    - name: mongodb-metrics.sharding
+      rules:
+        # Every mongos reports the same cluster-wide setting, so this takes the
+        # most enabled report per cluster rather than firing once per router.
+        - alert: MongoDBBalancerDisabled
+          expr: max by (cluster_name) (mongodb_mongos_sharding_balancer_enabled) == 0
+          for: 6h
+          labels:
+            severity: info
+          annotations:
+            summary: "The sharding balancer{{ with $labels.cluster_name }} of {{ . }}{{ end }} has been off for 6 hours"
+            description: >-
+              With the balancer off, chunks are not moved between shards, so new
+              data piles up where it lands. Backups and maintenance turn it off on
+              purpose; if nothing is running, sh.startBalancer() turns it back on.

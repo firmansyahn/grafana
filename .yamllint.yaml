@@ -1,0 +1,23 @@
+# yamllint settings for this repository. CI runs, from the repository root:
+#   yamllint --strict .
+extends: default
+
+# The default patterns, plus dashboard-linter's configuration (dashboards/.lint).
+yaml-files:
+  - "*.yaml"
+  - "*.yml"
+  - .yamllint
+  - .lint
+
+rules:
+  # Every file here holds a single document; a leading --- adds nothing.
+  document-start: disable
+  line-length:
+    max: 120
+    # PromQL, alert text and the annotations promtool expects verbatim read
+    # best unwrapped.
+    ignore: |
+      rules/
+  truthy:
+    # A workflow's `on:` is a key, not a boolean.
+    check-keys: false

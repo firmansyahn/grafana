@@ -1,0 +1,24 @@
+# grafana/dashboard-linter configuration for every dashboard in this
+# directory; CI lints each one with --strict. The rules excluded here are
+# conventions of Grafana's integration mixins that these dashboards
+# deliberately do not follow.
+exclusions:
+  template-job-rule:
+    reason: >-
+      Each dashboard shows one kind of target and selects it by metric name
+      or by the one job it reads, so there is no job to pick.
+  target-job-rule:
+    reason: >-
+      Queries select by metric name, which means the same thing whichever job
+      scraped it, or pin the one job they read.
+  template-instance-rule:
+    reason: >-
+      Dashboards filter by what they show (host, Patroni cluster and member,
+      MongoDB cluster and process), which is not always the instance label.
+  target-instance-rule:
+    reason: >-
+      Queries filter by those variables, interpolated as ${var:regex}, or
+      deliberately span every instance; the rule accepts only a literal
+      $instance.
+  uneditable-dashboard:
+    reason: Kept editable so an imported copy can be adjusted in Grafana.

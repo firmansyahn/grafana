@@ -1,0 +1,416 @@
+// mongodb_metrics
+//
+// Metrics for MongoDB -- a standalone mongod, the members of a replica set,
+// and the processes of a sharded cluster (shard members, config server
+// members, mongos routers) -- through Alloy's embedded exporter
+// (prometheus.exporter.mongodb, which is Percona's mongodb_exporter; v0.47 in
+// Alloy v1.19). Everything is remote-written to a Prometheus-compatible
+// backend (e.g. Mimir) under a single tenant.
+//
+// Node-local, like host_metrics and postgres_metrics: one mongodb declare per
+// MongoDB process on this host, each connecting to its own process over
+// loopback with a direct connection, and clustering disabled. A host of a
+// sharded cluster commonly runs three processes -- a shard member, a config
+// server member and a mongos -- so it gets three declares, one per port.
+//
+// Direct connections are the point. Without one the driver discovers the
+// replica set and sends every command to the primary, so each member's
+// collector would report the primary's numbers under its own name.
+// direct_connect is therefore on by default; leave it on for node-local use.
+//
+// Label shape:
+//
+//   node       the host, set exactly as host_metrics sets instance and node,
+//              so these series join onto that host's node_* series.
+//   instance   <node>:<port>, the port taken from mongodb_uri, so the
+//              processes of one host stay apart. Override with instance.
+//   job        integrations/mongodb by default, overridable with job_name.
+//
+// On top of that the exporter labels most series with the process's place
+// in the cluster: rs_nm (replica set name), cl_role (shardsvr, configsvr,
+// mongos, or empty for a plain replica set) and cl_id (the sharded cluster's
+// id). The member-state label it also adds, rs_state, is dropped here: it
+// changes on every election, which would start a new series for every metric
+// of the member each time. The member state is its own metric
+// (mongodb_rs_myState). Series from the exporter's compatible mode
+// (mongodb_mongod_replset_*) carry the replica set as set instead of rs_nm.
+//
+// Series volume. On MongoDB 8.2 one mongod's diagnostic data alone flattens
+// into some 6,000 series (every serverStatus and WiredTiger counter, the
+// storage statistics of the oplog and of internal collections index by
+// index, and a few metric names that embed peer addresses). keep_metrics
+// keeps the ones the repository's rules and dashboard use -- about 100 per
+// mongod plus 8 per database, some 30 per mongos -- and drops the rest before
+// they are sent; set it to ".+" to keep everything. Alloy's own default,
+// collect_all = true, would also turn on per-collection and per-index stats
+// of every collection (the exporter's discovering mode); this module keeps
+// those collectors off unless asked.
+//
+// Monitoring user. clusterMonitor on admin plus read on local (for the
+// oplog) is enough, e.g. for X.509 authentication:
+//     db.getSiblingDB("$external").createUser({
+//       user:  "CN=mongodb-exporter,OU=monitoring,O=example",
+//       roles: [{role: "clusterMonitor", db: "admin"}, {role: "read", db: "local"}]
+//     })
+// In a sharded cluster, users created through mongos live on the config
+// servers: they authenticate mongos and direct connections to config server
+// members, but NOT direct connections to shard members, which fail with
+// UserNotFound. Create the same user on each shard's replica set as well
+// (connected directly to that shard's primary) -- a shard-local user.
+//
+// What mongos reports. The exporter reads serverStatus through
+// getDiagnosticData, and mongos gives it nothing usable there (verified on
+// MongoDB 8.2 with exporter 0.47 and 0.51): a mongos declare yields
+// mongodb_up, the sharding state (balancer, shards, chunks) and per-database
+// sizes, but no connections or operation counters. Watch those on the shard
+// members.
+//
+// Delivery -- as in postgres_metrics, every declare takes either the embedded
+// remote_write (tenant_id, endpoint_url, endpoint_basic_auth_*) or forward_to,
+// mutually exclusive. The declares on one host share one remote_write by
+// giving one of them the endpoint and pointing the others' forward_to at its
+// exported receiver. External labels (region, zone, cluster_name or
+// external_labels) apply at whichever remote_write the series reach.
+//
+// Verified on a three-node sharded cluster (MongoDB 8.2, one shard, TLS with
+// X.509 authentication, Podman) with Alloy v1.19.2: config server members and
+// mongos routers, including the UserNotFound above and what mongos reports.
+//
+// Usage (one host of a sharded cluster: mongos, config server, shard member,
+// sharing one remote_write; the URI tail holds the TLS and X.509 options):
+//   mongodb_metrics.mongodb "shard" {
+//       mongodb_uri                  = "mongodb://127.0.0.1:27019/" + local.file.mongodb_uri_options.content
+//       tenant_id                    = "my-tenant"
+//       endpoint_url                 = sys.env("MIMIR_ENDPOINT_URL")
+//       endpoint_basic_auth_username = sys.env("AUTH_BASIC_USERNAME")
+//       endpoint_basic_auth_password = sys.env("AUTH_BASIC_PASSWORD")
+//   }
+//   mongodb_metrics.mongodb "configsvr" {
+//       mongodb_uri = "mongodb://127.0.0.1:27018/" + local.file.mongodb_uri_options.content
+//       forward_to  = [mongodb_metrics.mongodb.shard.receiver]
+//   }
+//   mongodb_metrics.mongodb "mongos" {
+//       mongodb_uri = "mongodb://127.0.0.1:27017/" + local.file.mongodb_uri_options.content
+//       forward_to  = [mongodb_metrics.mongodb.shard.receiver]
+//   }
+// where mongodb_uri_options is a local.file holding, for example,
+//   ?tls=true&tlsCAFile=/etc/mongo/ca.pem&tlsCertificateKeyFile=/etc/mongo/exporter.pem&authMechanism=MONGODB-X509&authSource=$external
+// Password authentication works the same way, e.g.
+//   mongodb://alloy_monitor:<password>@127.0.0.1:27017/admin
+// (URL-encode the password with encoding.url_encode if it has special
+// characters).
+
+// mongodb_metrics.mongodb
+//
+// One MongoDB process: mongod (standalone, replica set member, shard member,
+// config server member) or mongos.
+//
+// Collectors. Always on: the exporter's own up check and the diagnostic data
+// (serverStatus: connections, operation counters, WiredTiger cache and
+// tickets, the oplog window, asserts). On by default: replica set status
+// (member states, health, replication lag -- skipped on mongos), per-database
+// stats (sizes; one set of series per database), the sharding state (mongos
+// only) and the feature compatibility version. Off by default, because they
+// grow with the number of collections and indexes: top, collection stats,
+// index stats; and currentop, which lists every operation running longer
+// than currentop_slow_time. Turning on collection or index stats also turns
+// on the exporter's discovering mode, which covers every collection.
+//
+// What to watch:
+//   - mongodb_up == 0: the exporter cannot reach or authenticate to the
+//     process. It still answers the scrape, so up stays 1.
+//   - mongodb_rs_myState: 1 PRIMARY, 2 SECONDARY; 3 RECOVERING, 6 UNKNOWN,
+//     8 DOWN, 9 ROLLBACK and 10 REMOVED need a look.
+//   - mongodb_rs_members_health and _state: each member's view of the others.
+//   - mongodb_mongod_replset_member_replication_lag: seconds each secondary is
+//     behind the primary, from the member that reports it.
+//   - mongodb_mongod_replset_oplog_head_timestamp - _tail_timestamp: the
+//     oplog window, how long a member can be down and still catch up.
+//   - mongodb_connections{state="current"} against state="available".
+//   - mongodb_mongod_wiredtiger_concurrent_transactions_*_tickets: read and
+//     write tickets in use and available.
+//   - mongodb_ss_wt_cache_*: cache fill and dirty bytes against the maximum.
+declare "mongodb" {
+	// -- Required -----------------------------------------------------------
+	argument "mongodb_uri" {
+		comment = "secret connection URI of ONE MongoDB process on this node, e.g. mongodb://alloy_monitor:<password>@127.0.0.1:27017/admin, or with TLS and X.509 options (see the header). Keep it to one host: the port becomes part of the instance label."
+	}
+
+	// -- Delivery: embedded remote_write, or forward_to ---------------------
+	// An explicit [] coalesces to the default -- pass a real receiver, or omit.
+	argument "forward_to" {
+		comment  = "list(MetricsReceiver) to send metrics to INSTEAD of the embedded remote_write: another declare's exported receiver, to share one remote_write, or your own prometheus.relabel (default: unset, use the embedded remote_write)"
+		optional = true
+	}
+
+	argument "tenant_id" {
+		comment  = "The tenant (X-Scope-OrgID) for the embedded remote_write. Required unless forward_to is set."
+		optional = true
+		default  = ""
+	}
+
+	argument "endpoint_url" {
+		comment  = "Prometheus-compatible remote_write URL (e.g. Mimir) for the embedded writer. Required unless forward_to is set; the default points at a local Mimir so a misconfiguration fails loudly with connection errors rather than silently discarding metrics."
+		optional = true
+		default  = "http://localhost:9009/api/v1/push"
+	}
+	// Alloy has no conditional blocks, so basic_auth is always present on the
+	// embedded endpoint. Left empty it sends an empty Basic header, which an
+	// endpoint without authentication ignores.
+	argument "endpoint_basic_auth_username" {
+		comment  = "Basic-auth username for the embedded remote_write (default: \"\", no credentials)"
+		optional = true
+		default  = ""
+	}
+
+	argument "endpoint_basic_auth_password" {
+		comment  = "Basic-auth password for the embedded remote_write (default: \"\", no credentials)"
+		optional = true
+		default  = ""
+	}
+
+	// -- Optional -----------------------------------------------------------
+	argument "node_name" {
+		comment  = "Node name for the node label and the host part of instance (default: sys.env(\"K8S_NODE_NAME\"), else the hostname)"
+		optional = true
+	}
+
+	argument "instance" {
+		comment  = "Value for the instance label (default: \"<node_name>:<port from mongodb_uri>\", or <node_name>:27017 when the URI names no port)"
+		optional = true
+	}
+
+	argument "direct_connect" {
+		comment  = "Connect to the one process in mongodb_uri rather than discovering its replica set (default: true). Leave it on for node-local collection: without it every member reports the primary's numbers."
+		optional = true
+		default  = true
+	}
+
+	argument "compatible_mode" {
+		comment  = "Also expose the metric names of mongodb_exporter before v0.20 (mongodb_connections, mongodb_op_counters_total, mongodb_mongod_*), which the repository's rules and dashboard use alongside the newer ones (default: true, as Alloy's)"
+		optional = true
+		default  = true
+	}
+
+	argument "enable_replicaset_status" {
+		comment  = "Collect replSetGetStatus: member states, health, optimes, replication lag (default: true; mongos is skipped automatically)"
+		optional = true
+		default  = true
+	}
+
+	argument "enable_db_stats" {
+		comment  = "Collect dbStats for every database: sizes, objects, collections, indexes (default: true)"
+		optional = true
+		default  = true
+	}
+
+	argument "enable_shards" {
+		comment  = "On mongos, collect the sharding state: balancer, shards, chunks (default: true; mongod ignores it)"
+		optional = true
+		default  = true
+	}
+
+	argument "enable_fcv" {
+		comment  = "Collect the feature compatibility version (default: true)"
+		optional = true
+		default  = true
+	}
+
+	argument "enable_top_metrics" {
+		comment  = "Collect per-collection time and counts from the top command (default: false; one set of series per collection)"
+		optional = true
+		default  = false
+	}
+
+	argument "enable_coll_stats" {
+		comment  = "Collect collStats for every collection (default: false; turns on the exporter's discovering mode)"
+		optional = true
+		default  = false
+	}
+
+	argument "enable_index_stats" {
+		comment  = "Collect $indexStats for every index (default: false; turns on the exporter's discovering mode)"
+		optional = true
+		default  = false
+	}
+
+	argument "enable_currentop_metrics" {
+		comment  = "Collect the uptime of operations running longer than currentop_slow_time (default: false)"
+		optional = true
+		default  = false
+	}
+
+	argument "currentop_slow_time" {
+		comment  = "Threshold for enable_currentop_metrics (default: \"1m\")"
+		optional = true
+		default  = "1m"
+	}
+
+	argument "enable_pbm_metrics" {
+		comment  = "Collect Percona Backup for MongoDB status (default: false). The monitoring user needs read access to PBM's collections in admin."
+		optional = true
+		default  = false
+	}
+
+	argument "keep_metrics" {
+		comment  = "Regex of metric names to keep; the rest are dropped before they are sent (default: the curated set described in the header -- about 100 series per mongod plus 8 per database; \".+\" keeps everything, some 6,000 per mongod on MongoDB 8.2)"
+		optional = true
+		default  = "mongodb_(up|version_info|fcv_feature_compatibility_version|ss_uptime|rs_myState|rs_term|rs_members_(state|health|optimeDate|pingMs|self)|mongod_replset_(my_state|number_of_members|member_replication_lag|oplog_head_timestamp|oplog_tail_timestamp)|ss_oplog_(earliestOptime|latestOptime)|connections|op_counters_total|mongod_op_counters_repl_total|mongod_metrics_(document_total|query_executor_total|cursor_open|cursor_timed_out_total|operation_total)|mongod_op_latencies_(latency|ops)_total|mongod_global_lock_current_queue|asserts_total|extra_info_page_faults_total|ss_mem_(resident|virtual)|ss_wt_cache_(bytes_currently_in_the_cache|maximum_bytes_configured|tracked_dirty_bytes_in_the_cache|modified_pages_evicted|unmodified_pages_evicted)|mongod_wiredtiger_concurrent_transactions_(available|out|total)_tickets|ss_network_(bytesIn|bytesOut|numRequests)|ss_transactions_(currentActive|currentOpen|totalStarted|totalCommitted|totalAborted)|dbstats_(dataSize|storageSize|indexSize|objects|collections|indexes|fsUsedSize|fsTotalSize)|mongos_sharding_.+|(top|collstats|indexstats|currentop|pbm)_.+)"
+	}
+
+	argument "scrape_interval" {
+		comment  = "How often to collect (default: \"30s\")"
+		optional = true
+		default  = "30s"
+	}
+
+	argument "scrape_timeout" {
+		comment  = "Scrape timeout (default: \"10s\")"
+		optional = true
+		default  = "10s"
+	}
+
+	argument "job_name" {
+		comment  = "Value for the job label (default: \"integrations/mongodb\", the exporter's own)"
+		optional = true
+		default  = "integrations/mongodb"
+	}
+
+	argument "region" {
+		comment  = "Value for the region external label (default: \"\", unset)"
+		optional = true
+	}
+
+	argument "zone" {
+		comment  = "Value for the zone external label (default: \"\", unset)"
+		optional = true
+	}
+
+	argument "cluster_name" {
+		comment  = "Value for the cluster_name external label (default: \"\", unset)"
+		optional = true
+	}
+	// Alloy has no map-merge function, so this REPLACES the default external
+	// label set rather than adding to it -- same contract as host_metrics.
+	argument "external_labels" {
+		comment  = "Complete external_labels map for the embedded remote_write, REPLACING the region/zone/cluster_name defaults (default: unset, which keeps them). Use it to carry site-specific labels such as environment or role."
+		optional = true
+	}
+
+	prometheus.exporter.mongodb "default" {
+		mongodb_uri              = argument.mongodb_uri.value
+		direct_connect           = argument.direct_connect.value
+		compatible_mode          = argument.compatible_mode.value
+		collect_all              = false
+		enable_diagnostic_data   = true
+		enable_replicaset_status = argument.enable_replicaset_status.value
+		enable_db_stats          = argument.enable_db_stats.value
+		enable_shards            = argument.enable_shards.value
+		enable_fcv               = argument.enable_fcv.value
+		enable_top_metrics       = argument.enable_top_metrics.value
+		enable_coll_stats        = argument.enable_coll_stats.value
+		enable_index_stats       = argument.enable_index_stats.value
+		discovering_mode         = argument.enable_coll_stats.value || argument.enable_index_stats.value
+		enable_currentop_metrics = argument.enable_currentop_metrics.value
+		currentop_slow_time      = argument.currentop_slow_time.value
+		enable_pbm_metrics       = argument.enable_pbm_metrics.value
+	}
+
+	discovery.relabel "mongodb" {
+		targets = prometheus.exporter.mongodb.default.targets
+
+		// The exporter's own instance is the URI's host:port -- the same
+		// "127.0.0.1:27017" on every node that connects over loopback. The
+		// node name tells nodes apart; the port tells the processes of one
+		// node apart. A URI without a port means MongoDB's default, 27017.
+		rule {
+			source_labels = ["instance"]
+			regex         = "[^:]+"
+			target_label  = "instance"
+			replacement   = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"), constants.hostname) + ":27017"
+		}
+
+		rule {
+			source_labels = ["instance"]
+			regex         = "[^:]+:([0-9]+)"
+			target_label  = "instance"
+			replacement   = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"), constants.hostname) + ":$1"
+		}
+		// instance, when given, wins; otherwise "$1" writes the value back.
+		rule {
+			source_labels = ["instance"]
+			regex         = "(.*)"
+			target_label  = "instance"
+			replacement   = coalesce(argument.instance.value, "$1")
+		}
+
+		rule {
+			target_label = "node"
+			replacement  = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"), constants.hostname)
+		}
+
+		// Explicit, as in host_metrics: the exporter's target already carries
+		// job="integrations/mongodb", which would win over the scrape's
+		// job_name.
+		rule {
+			target_label = "job"
+			replacement  = argument.job_name.value
+		}
+	}
+
+	prometheus.scrape "mongodb" {
+		targets    = discovery.relabel.mongodb.output
+		forward_to = [prometheus.relabel.mongodb.receiver]
+
+		scrape_interval = argument.scrape_interval.value
+		scrape_timeout  = argument.scrape_timeout.value
+
+		// Local database only -- do not distribute across the cluster.
+		clustering {
+			enabled = false
+		}
+	}
+
+	prometheus.relabel "mongodb" {
+		forward_to = coalesce(argument.forward_to.value, [prometheus.remote_write.default.receiver])
+
+		// up is the scrape's own series; keep it whatever keep_metrics says.
+		rule {
+			source_labels = ["__name__"]
+			regex         = "up|(" + argument.keep_metrics.value + ")"
+			action        = "keep"
+		}
+		// Changes on every election; see the header.
+		rule {
+			regex  = "rs_state"
+			action = "labeldrop"
+		}
+	}
+
+	// Exposed so the other declares on this host can forward into this one's
+	// tenant-configured remote_write, as in the usage at the top of the file.
+	export "receiver" {
+		value = prometheus.remote_write.default.receiver
+	}
+
+	prometheus.remote_write "default" {
+		endpoint {
+			url = argument.endpoint_url.value
+
+			basic_auth {
+				username = argument.endpoint_basic_auth_username.value
+				password = argument.endpoint_basic_auth_password.value
+			}
+
+			headers = {
+				"X-Scope-OrgID" = argument.tenant_id.value,
+			}
+		}
+
+		external_labels = coalesce(argument.external_labels.value, {
+			region       = coalesce(argument.region.value, ""),
+			zone         = coalesce(argument.zone.value, ""),
+			cluster_name = coalesce(argument.cluster_name.value, ""),
+		})
+	}
+}

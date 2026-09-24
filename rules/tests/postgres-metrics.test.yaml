@@ -1,4 +1,4 @@
-# Unit tests for postgres-metrics.yaml. Run them with alerts/test.sh: promtool
+# Unit tests for postgres-metrics.yaml. Run them with rules/test.sh: promtool
 # reads plain rule files, not PrometheusRules, so the script writes the groups
 # out as postgres-metrics.rules.yaml beside a copy of this file.
 #

@@ -38,7 +38,7 @@
     "list": [
       {
         "name": "datasource",
-        "label": "Prometheus datasource",
+        "label": "Data source",
         "type": "datasource",
         "query": "prometheus",
         "current": {

@@ -1,7 +1,7 @@
 #!/bin/sh
 # Checks each PrometheusRule in this directory and runs its unit tests:
 #
-#   alerts/test.sh
+#   rules/test.sh
 #
 # promtool reads plain rule files, not PrometheusRules, so each one's groups
 # are written out as <name>.rules.yaml in a temporary directory first, beside a

@@ -1,0 +1,155 @@
+# Lints what hosts and Grafana take from this repository. Hosts import
+# alloy/modules/ straight from a branch (main, or a feature branch on trial),
+# so a module that does not load breaks their configuration at the next pull.
+name: Lint
+
+on:
+  # Every branch, because a host can import one before it merges.
+  push:
+    branches: ["**"]
+  # For pull requests from forks. A branch of this repository was already
+  # linted by its push, so the jobs skip those.
+  pull_request:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    # Runs steps with -eo pipefail, which a step without a shell does not get.
+    shell: bash
+
+jobs:
+  alloy:
+    name: Alloy modules
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      ALLOY_VERSION: v1.19.2
+      # alloy-linux-amd64.zip, from the release's SHA256SUMS.
+      ALLOY_SHA256: 3694ea4e1044b367e1c21ffe28117f209c5989fa5e604d000321809f871ab701
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Alloy
+        working-directory: ${{ runner.temp }}
+        run: |
+          base=https://github.com/grafana/alloy/releases/download
+          curl -fsSLo alloy.zip "$base/$ALLOY_VERSION/alloy-linux-amd64.zip"
+          sha256sum -c <<<"$ALLOY_SHA256  alloy.zip"
+          unzip -q alloy.zip alloy-linux-amd64
+          install -D alloy-linux-amd64 bin/alloy
+          echo "$PWD/bin" >>"$GITHUB_PATH"
+      - name: alloy fmt
+        run: |
+          status=0
+          for f in alloy/modules/*.alloy; do
+            if ! alloy fmt "$f" | diff -u --label "$f" --label "$f (alloy fmt)" "$f" -; then
+              echo "::error file=$f::Not in alloy fmt style; run: alloy fmt -w $f"
+              status=1
+            fi
+          done
+          exit "$status"
+      - name: alloy validate
+        # Also after a formatting failure, so one run reports both.
+        if: ${{ !cancelled() }}
+        run: |
+          status=0
+          for f in alloy/modules/*.alloy; do
+            if alloy validate "$f"; then
+              echo "ok $f"
+            else
+              status=1
+            fi
+          done
+          exit "$status"
+
+  yaml:
+    name: YAML
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      YAMLLINT_VERSION: 1.38.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: yamllint
+        run: pipx run --spec "yamllint==$YAMLLINT_VERSION" yamllint --strict --format github .
+
+  dashboards:
+    name: Grafana dashboards
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      DASHBOARD_LINTER_VERSION: 0.3.0
+      # dashboard-linter_<version>_linux_amd64.tar.gz, from the release's
+      # checksums.txt.
+      DASHBOARD_LINTER_SHA256: 9a0eecb84ff22005dbd21c39ffd91534b407b511c45c21879df62ad0de33d79f
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install dashboard-linter
+        working-directory: ${{ runner.temp }}
+        run: |
+          base=https://github.com/grafana/dashboard-linter/releases/download
+          archive="dashboard-linter_${DASHBOARD_LINTER_VERSION}_linux_amd64.tar.gz"
+          curl -fsSLO "$base/v$DASHBOARD_LINTER_VERSION/$archive"
+          sha256sum -c <<<"$DASHBOARD_LINTER_SHA256  $archive"
+          tar -xzf "$archive" dashboard-linter
+          install -D dashboard-linter bin/dashboard-linter
+          echo "$PWD/bin" >>"$GITHUB_PATH"
+      - name: dashboard-linter
+        # Rules the dashboards do not follow are excluded in dashboards/.lint.
+        run: |
+          status=0
+          for f in dashboards/*.json; do
+            # The linter lists every rule it ran; print that only on failure.
+            if out=$(dashboard-linter lint --strict "$f" 2>&1); then
+              echo "ok $f"
+            else
+              printf '%s\n' "$out"
+              echo "::error file=$f::dashboard-linter found problems in $f"
+              status=1
+            fi
+          done
+          exit "$status"
+
+  rules:
+    name: Prometheus rules
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PROMETHEUS_VERSION: 3.14.0
+      # prometheus-<version>.linux-amd64.tar.gz, from the release's
+      # sha256sums.txt.
+      PROMETHEUS_SHA256: f665c6da19eb7ba399c915d30c7d9793c9b417bf8a749b504bc470678631478d
+      YQ_VERSION: v4.53.6
+      # yq_linux_amd64, from the release's checksums-bsd.
+      YQ_SHA256: c5f056448f973ae7d39b5401949648a78f2dc1947d6a8eb65be60d5c504b9385
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install promtool and yq
+        working-directory: ${{ runner.temp }}
+        run: |
+          base=https://github.com/prometheus/prometheus/releases/download
+          dir="prometheus-$PROMETHEUS_VERSION.linux-amd64"
+          curl -fsSLO "$base/v$PROMETHEUS_VERSION/$dir.tar.gz"
+          sha256sum -c <<<"$PROMETHEUS_SHA256  $dir.tar.gz"
+          tar -xzf "$dir.tar.gz" "$dir/promtool"
+          install -D "$dir/promtool" bin/promtool
+          base=https://github.com/mikefarah/yq/releases/download
+          curl -fsSLo yq "$base/$YQ_VERSION/yq_linux_amd64"
+          sha256sum -c <<<"$YQ_SHA256  yq"
+          install -D yq bin/yq
+          echo "$PWD/bin" >>"$GITHUB_PATH"
+      - name: promtool check and test
+        run: rules/test.sh

@@ -118,6 +118,7 @@ declare "journal" {
 		comment  = "list(LogsReceiver) to send logs to INSTEAD of the embedded loki.write -- e.g. your own loki.process for site-specific redaction, which then writes (default: unset, use the embedded writer)"
 		optional = true
 	}
+
 	argument "endpoint_url" {
 		comment  = "Loki push URL for the embedded writer, e.g. https://loki.example.com/loki/api/v1/push. Required unless forward_to is set; the default points at a local Loki so a misconfiguration fails loudly with connection errors rather than silently discarding logs."
 		optional = true
@@ -131,6 +132,7 @@ declare "journal" {
 		optional = true
 		default  = ""
 	}
+
 	argument "endpoint_basic_auth_password" {
 		comment  = "Basic-auth password for the embedded writer (default: \"\", no credentials)"
 		optional = true
@@ -142,49 +144,59 @@ declare "journal" {
 		comment  = "Value for the node label (default: sys.env(\"K8S_NODE_NAME\"), else the journal's own _HOSTNAME, which is the HOST's name even when the collector runs in a container)"
 		optional = true
 	}
+
 	argument "journal_path" {
 		comment  = "Directory to read journal files from (default: \"\", which reads both /var/log/journal and /run/log/journal)"
 		optional = true
 		default  = ""
 	}
+
 	argument "max_age" {
 		comment  = "How far back to read on a FIRST start, when no cursor exists yet (default: \"7h\"). Afterwards Alloy resumes from its stored cursor."
 		optional = true
 		default  = "7h"
 	}
+
 	argument "matches" {
 		comment  = "systemd journal match filter applied at the source, space-separated FIELD=VALUE pairs ANDed together, e.g. \"_TRANSPORT=kernel\" or \"_SYSTEMD_UNIT=ssh.service\" (default: \"\", everything). Filtering here is cheaper than dropping later. journalctl's \"+\" (OR) is not supported."
 		optional = true
 		default  = ""
 	}
+
 	argument "container_logs" {
 		comment  = "What to do with container stdout/stderr that a runtime's journald log driver writes into the journal: \"drop\" (default, they are collected by other means) or \"keep\". Measured at 69% of all journal entries on the Podman hosts here; a Docker host on the default json-file driver has none of them in the journal at all."
 		optional = true
 		default  = "drop"
 	}
+
 	argument "drop_units" {
 		comment  = "Regex matching the unit label of entries whose INFO-level chatter is dropped -- periodic timers that log a start/stop pair on every run and say nothing worth keeping when they succeed (default: \"fwupd-refresh.service\"). Set \"\" to keep everything. Fully anchored, as LogQL label matchers always are, so it matches whole unit names only. Only level=info is dropped, so a failure from the same unit still arrives at warn or error."
 		optional = true
 		default  = "fwupd-refresh.service"
 	}
+
 	argument "healthcheck_noise" {
 		comment  = "What to do with Podman healthcheck bookkeeping -- the \"container health_status\" lines and the audit SERVICE_START/STOP pairs for the transient units they run in: \"drop\" (default) or \"keep\". Roughly 30% of journal entries on the Podman hosts here. Use \"keep\" where audit completeness is a compliance requirement."
 		optional = true
 		default  = "drop"
 	}
+
 	argument "job_name" {
 		comment  = "Value for the job label (default: \"integrations/journal\")"
 		optional = true
 		default  = "integrations/journal"
 	}
+
 	argument "cluster_name" {
 		comment  = "Value for the cluster_name label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "region" {
 		comment  = "Value for the region label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "zone" {
 		comment  = "Value for the zone label (default: \"\", unset)"
 		optional = true
@@ -686,10 +698,10 @@ declare "journal" {
 		// record types for no selector benefit.
 		stage.structured_metadata {
 			values = {
-				pid           = "",
-				boot_id       = "",
-				audit_type    = "",
-				audit_result  = "",
+				pid          = "",
+				boot_id      = "",
+				audit_type   = "",
+				audit_result = "",
 			}
 		}
 
@@ -766,16 +778,19 @@ declare "files" {
 		comment  = "list(LogsReceiver) to send logs to INSTEAD of the embedded loki.write (default: unset, use the embedded writer)"
 		optional = true
 	}
+
 	argument "endpoint_url" {
 		comment  = "Loki push URL for the embedded writer. Required unless forward_to is set."
 		optional = true
 		default  = "http://localhost:3100/loki/api/v1/push"
 	}
+
 	argument "endpoint_basic_auth_username" {
 		comment  = "Basic-auth username for the embedded writer (default: \"\", no credentials)"
 		optional = true
 		default  = ""
 	}
+
 	argument "endpoint_basic_auth_password" {
 		comment  = "Basic-auth password for the embedded writer (default: \"\", no credentials)"
 		optional = true
@@ -788,38 +803,46 @@ declare "files" {
 		optional = true
 		default  = "/var/log/{syslog,messages,auth.log,secure,kern.log,daemon.log}"
 	}
+
 	argument "path_exclude" {
 		comment  = "doublestar glob of files to skip (default: rotated and compressed copies). The default `path` cannot match them anyway -- syslog.1 is not syslog -- but a caller-supplied \"/var/log/**\" would."
 		optional = true
 		default  = "/var/log/**/*.{gz,xz,zst,bz2,old,bak,[0-9]}"
 	}
+
 	argument "tail_from_end" {
 		comment  = "Start at the END of a file the collector has no stored offset for, instead of reading it from the top (default: false). true skips the backlog on first start, at the cost of losing it."
 		optional = true
 		default  = false
 	}
+
 	argument "timestamp_location" {
 		comment  = "IANA time zone the BSD-syslog timestamps in these files are written in (default: \"Local\", the collector's own zone). BSD syslog carries no zone, so a collector in UTC reading a host that logs in +07:00 would shift every entry by 7 hours."
 		optional = true
 		default  = "Local"
 	}
+
 	argument "node_name" {
 		comment  = "Value for the node label (default: sys.env(\"K8S_NODE_NAME\"), else the hostname). Under a container runtime WITHOUT host networking the hostname is the container id -- pass this explicitly there."
 		optional = true
 	}
+
 	argument "job_name" {
 		comment  = "Value for the job label (default: \"integrations/varlogs\")"
 		optional = true
 		default  = "integrations/varlogs"
 	}
+
 	argument "cluster_name" {
 		comment  = "Value for the cluster_name label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "region" {
 		comment  = "Value for the region label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "zone" {
 		comment  = "Value for the zone label (default: \"\", unset)"
 		optional = true
@@ -1116,16 +1139,19 @@ declare "syslog" {
 		comment  = "list(LogsReceiver) to send logs to INSTEAD of the embedded loki.write (default: unset, use the embedded writer)"
 		optional = true
 	}
+
 	argument "endpoint_url" {
 		comment  = "Loki push URL for the embedded writer. Required unless forward_to is set."
 		optional = true
 		default  = "http://localhost:3100/loki/api/v1/push"
 	}
+
 	argument "endpoint_basic_auth_username" {
 		comment  = "Basic-auth username for the embedded writer (default: \"\", no credentials)"
 		optional = true
 		default  = ""
 	}
+
 	argument "endpoint_basic_auth_password" {
 		comment  = "Basic-auth password for the embedded writer (default: \"\", no credentials)"
 		optional = true
@@ -1138,44 +1164,53 @@ declare "syslog" {
 		optional = true
 		default  = "0.0.0.0:514"
 	}
+
 	argument "syslog_format" {
 		comment  = "Wire format this listener parses: \"rfc5424\" (default) or \"rfc3164\" (legacy BSD). A sender using the other format produces parse errors, counted by loki_source_syslog_parsing_errors_total."
 		optional = true
 		default  = "rfc5424"
 	}
+
 	argument "use_incoming_timestamp" {
 		comment  = "Use the timestamp in the message instead of the time it arrived (default: true). A sender with a badly wrong clock then produces entries Loki may reject as too old or too far in the future -- set false to stamp arrival time for a fleet with unreliable clocks."
 		optional = true
 		default  = true
 	}
+
 	argument "max_message_length" {
 		comment  = "Longest message accepted, in bytes (default: 8192). Longer messages are truncated; raise it for senders that ship stack traces."
 		optional = true
 		default  = 8192
 	}
+
 	argument "idle_timeout" {
 		comment  = "How long an idle TCP connection is held open (default: \"120s\")"
 		optional = true
 		default  = "120s"
 	}
+
 	argument "label_structured_data" {
 		comment  = "Turn RFC5424 structured data into labels (default: false). Senders control those keys, so this hands label cardinality to them -- leave it off unless you know the senders."
 		optional = true
 		default  = false
 	}
+
 	argument "job_name" {
 		comment  = "Value for the job label (default: \"integrations/syslog\")"
 		optional = true
 		default  = "integrations/syslog"
 	}
+
 	argument "cluster_name" {
 		comment  = "Value for the cluster_name label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "region" {
 		comment  = "Value for the region label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "zone" {
 		comment  = "Value for the zone label (default: \"\", unset)"
 		optional = true

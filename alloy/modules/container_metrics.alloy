@@ -79,12 +79,15 @@ declare "apps" {
 	argument "tenant_id" {
 		comment = "The tenant (X-Scope-OrgID) to write container application metrics to"
 	}
+
 	argument "endpoint_url" {
 		comment = "Prometheus-compatible remote_write URL (e.g. Mimir)"
 	}
+
 	argument "endpoint_basic_auth_username" {
 		comment = "Basic-auth username for the remote_write endpoint"
 	}
+
 	argument "endpoint_basic_auth_password" {
 		comment = "Basic-auth password for the remote_write endpoint"
 	}
@@ -95,63 +98,76 @@ declare "apps" {
 		optional = true
 		default  = "unix:///var/run/docker.sock"
 	}
+
 	argument "runtime" {
 		comment  = "Value for the runtime label: \"docker\" (default) or \"podman\". Discovery cannot tell them apart -- Podman answers the Docker API -- so this is declared by the caller, and it matches the label host_metrics.containers derives from the cgroup path."
 		optional = true
 		default  = "docker"
 	}
+
 	argument "node_name" {
 		comment  = "Value for the node label (default: sys.env(\"K8S_NODE_NAME\"), else the hostname)"
 		optional = true
 	}
+
 	argument "enable_label" {
 		comment  = "Container label that opts a container in, matched against \"true\" (default: \"metrics.enable\")"
 		optional = true
 		default  = "metrics.enable"
 	}
+
 	argument "port_label" {
 		comment  = "Container label holding the port to scrape (default: \"metrics.port\"). Without it the address discovery reports is used, which is only useful for containers that publish exactly one port."
 		optional = true
 		default  = "metrics.port"
 	}
+
 	argument "path_label" {
 		comment  = "Container label holding the metrics path (default: \"metrics.path\", falling back to /metrics)"
 		optional = true
 		default  = "metrics.path"
 	}
+
 	argument "scheme_label" {
 		comment  = "Container label holding the scheme, http or https (default: \"metrics.scheme\", falling back to http)"
 		optional = true
 		default  = "metrics.scheme"
 	}
+
 	argument "refresh_interval" {
 		comment  = "How often to re-list containers from the runtime API (default: \"30s\")"
 		optional = true
 		default  = "30s"
 	}
+
 	argument "scrape_interval" {
 		comment  = "Scrape interval for discovered containers (default: \"30s\")"
 		optional = true
 		default  = "30s"
 	}
+
 	argument "scrape_timeout" {
 		comment  = "Scrape timeout for discovered containers (default: \"10s\")"
 		optional = true
 		default  = "10s"
 	}
+
 	argument "job_name" {
 		comment  = "Value for the job label (default: \"containers\")"
 		optional = true
 		default  = "containers"
 	}
+
 	argument "region" {
 		comment  = "Value for the region external label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "zone" {
 		comment  = "Value for the zone external label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "cluster_name" {
 		comment  = "Value for the cluster_name external label (default: \"\", unset)"
 		optional = true

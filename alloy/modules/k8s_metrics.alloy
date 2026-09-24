@@ -49,15 +49,19 @@ declare "kubernetes" {
 	argument "namespaces" {
 		comment = "The namespaces to look for targets in"
 	}
+
 	argument "tenant_id" {
 		comment = "The tenant (X-Scope-OrgID) to write metrics to"
 	}
+
 	argument "endpoint_url" {
 		comment = "Prometheus-compatible remote_write URL (e.g. Mimir)"
 	}
+
 	argument "endpoint_basic_auth_username" {
 		comment = "Basic-auth username for the remote_write endpoint"
 	}
+
 	argument "endpoint_basic_auth_password" {
 		comment = "Basic-auth password for the remote_write endpoint"
 	}
@@ -67,18 +71,22 @@ declare "kubernetes" {
 		comment  = "Pod meta-label to map to a project_name label, e.g. \"__meta_kubernetes_pod_label_app_kubernetes_io_part_of\". Empty disables it (default: \"\")"
 		optional = true
 	}
+
 	argument "region" {
 		comment  = "Value for the region external label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "zone" {
 		comment  = "Value for the zone external label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "cluster_name" {
 		comment  = "Value for the cluster_name external label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "kubernetes_role" {
 		comment  = "Service discovery role for ServiceMonitors: \"endpointslice\" (default) or \"endpoints\". Endpointslice is the safe default: every Service with endpoints has EndpointSlices, whether the endpoint controller built them or a human did, so it resolves everything the legacy role does AND selectorless Services whose targets are external VMs published as a hand-maintained EndpointSlice. Those have no Endpoints object at all -- mirroring only runs Endpoints -> EndpointSlice, never the reverse -- so under \"endpoints\" such a ServiceMonitor is discovered and resolves to ZERO targets: no error, no `up` series, nothing to notice. Override to \"endpoints\" only to work around a cluster that cannot grant endpointslices RBAC. Requires Alloy v1.6.0+."
 		optional = true
@@ -110,6 +118,7 @@ declare "kubernetes" {
 
 	discovery.kubernetes "pods" {
 		role = "pod"
+
 		namespaces {
 			names = argument.namespaces.value
 		}
@@ -155,14 +164,17 @@ declare "kubernetes" {
 			source_labels = ["__meta_kubernetes_namespace"]
 			target_label  = "namespace"
 		}
+
 		rule {
 			source_labels = ["__meta_kubernetes_pod_name"]
 			target_label  = "pod"
 		}
+
 		rule {
 			source_labels = ["__meta_kubernetes_pod_container_name"]
 			target_label  = "container"
 		}
+
 		rule {
 			source_labels = ["__meta_kubernetes_pod_node_name"]
 			target_label  = "node"
@@ -276,15 +288,19 @@ declare "crds" {
 	argument "namespaces" {
 		comment = "The namespaces to look for ServiceMonitor/PodMonitor CRDs in"
 	}
+
 	argument "tenant_id" {
 		comment = "The tenant (X-Scope-OrgID) to write metrics to"
 	}
+
 	argument "endpoint_url" {
 		comment = "Prometheus-compatible remote_write URL (e.g. Mimir)"
 	}
+
 	argument "endpoint_basic_auth_username" {
 		comment = "Basic-auth username for the remote_write endpoint"
 	}
+
 	argument "endpoint_basic_auth_password" {
 		comment = "Basic-auth password for the remote_write endpoint"
 	}
@@ -297,14 +313,17 @@ declare "crds" {
 		comment  = "Value for the region external label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "zone" {
 		comment  = "Value for the zone external label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "cluster_name" {
 		comment  = "Value for the cluster_name external label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "kubernetes_role" {
 		comment  = "Service discovery role for ServiceMonitors: \"endpointslice\" (default) or \"endpoints\". Endpointslice is the safe default: every Service with endpoints has EndpointSlices, whether the endpoint controller built them or a human did, so it resolves everything the legacy role does AND selectorless Services whose targets are external VMs published as a hand-maintained EndpointSlice. Those have no Endpoints object at all -- mirroring only runs Endpoints -> EndpointSlice, never the reverse -- so under \"endpoints\" such a ServiceMonitor is discovered and resolves to ZERO targets: no error, no `up` series, nothing to notice. Override to \"endpoints\" only to work around a cluster that cannot grant endpointslices RBAC. Requires Alloy v1.6.0+."
 		optional = true
@@ -362,15 +381,19 @@ declare "annotations" {
 	argument "namespaces" {
 		comment = "The namespaces to look for annotated pods in"
 	}
+
 	argument "tenant_id" {
 		comment = "The tenant (X-Scope-OrgID) to write metrics to"
 	}
+
 	argument "endpoint_url" {
 		comment = "Prometheus-compatible remote_write URL (e.g. Mimir)"
 	}
+
 	argument "endpoint_basic_auth_username" {
 		comment = "Basic-auth username for the remote_write endpoint"
 	}
+
 	argument "endpoint_basic_auth_password" {
 		comment = "Basic-auth password for the remote_write endpoint"
 	}
@@ -380,14 +403,17 @@ declare "annotations" {
 		comment  = "Pod meta-label to map to a project_name label, e.g. \"__meta_kubernetes_pod_label_app_kubernetes_io_part_of\". Empty disables it (default: \"\")"
 		optional = true
 	}
+
 	argument "region" {
 		comment  = "Value for the region external label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "zone" {
 		comment  = "Value for the zone external label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "cluster_name" {
 		comment  = "Value for the cluster_name external label (default: \"\", unset)"
 		optional = true
@@ -395,6 +421,7 @@ declare "annotations" {
 
 	discovery.kubernetes "pods" {
 		role = "pod"
+
 		namespaces {
 			names = argument.namespaces.value
 		}
@@ -440,14 +467,17 @@ declare "annotations" {
 			source_labels = ["__meta_kubernetes_namespace"]
 			target_label  = "namespace"
 		}
+
 		rule {
 			source_labels = ["__meta_kubernetes_pod_name"]
 			target_label  = "pod"
 		}
+
 		rule {
 			source_labels = ["__meta_kubernetes_pod_container_name"]
 			target_label  = "container"
 		}
+
 		rule {
 			source_labels = ["__meta_kubernetes_pod_node_name"]
 			target_label  = "node"

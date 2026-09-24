@@ -1,0 +1,340 @@
+# Unit tests for mongodb-metrics.yaml. Run them with rules/test.sh: promtool
+# reads plain rule files, not PrometheusRules, so the script writes the groups
+# out as mongodb-metrics.rules.yaml beside a copy of this file.
+#
+# Every rule has a firing case. The cases a rule must NOT fire on are commented
+# where they appear.
+rule_files:
+  - mongodb-metrics.rules.yaml
+evaluation_interval: 1m
+tests:
+  - name: process down, scrape failing, target vanished vs job renamed
+    interval: 1m
+    input_series:
+      - series: mongodb_up{job="integrations/mongodb", instance="n1:27017"}
+        values: 1x5 0x155
+      - series: up{job="integrations/mongodb", instance="n1:27017"}
+        values: 1x160
+      - series: up{job="integrations/mongodb", instance="n2:27018"}
+        values: 1x5 0x155
+      # Not a MongoDB job.
+      - series: up{job="integrations/unix", instance="n3"}
+        values: 0x160
+      - series: up{job="integrations/mongodb", instance="n4:27019"}
+        values: 1x119
+      # n5's job is renamed at 120m. Same instance: not missing.
+      - series: up{job="mongodb", instance="n5:27017"}
+        values: 1x119
+      - series: up{job="integrations/mongodb", instance="n5:27017"}
+        values: _x120 1x40
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: MongoDBDown
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: MongoDBDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: integrations/mongodb
+              instance: n1:27017
+            exp_annotations:
+              description: "For 2 minutes the exporter has not been able to connect and authenticate to n1:27017: the process is down or not accepting connections, or it rejects the monitoring user (TLS, credentials, or a user that does not exist on that process -- a shard member of a sharded cluster needs a shard-local one). The Alloy log has the exporter's error."
+              summary: "MongoDB on n1:27017 is down or refuses the exporter"
+      - eval_time: 12m
+        alertname: MongoDBTargetDown
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: integrations/mongodb
+              instance: n2:27018
+            exp_annotations:
+              description: "The scrape of integrations/mongodb on n2:27018 has failed for 5 minutes. With the module's embedded exporter that points at Alloy itself; with a separate mongodb_exporter, at the exporter being down or unreachable."
+              summary: "integrations/mongodb on n2:27018 is failing its scrapes"
+      - eval_time: 122m
+        alertname: MongoDBTargetMissing
+        exp_alerts: []
+      - eval_time: 132m
+        alertname: MongoDBTargetMissing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: integrations/mongodb
+              instance: n4:27019
+            exp_annotations:
+              description: "Nothing from integrations/mongodb on n4:27019 for 10 minutes, although it reported within the last 7 days. The node is down, or the Alloy that scrapes it is. A target removed or renamed on purpose keeps this firing for up to 7 days; silence it."
+              summary: "integrations/mongodb on n4:27019 has stopped reporting"
+
+  - name: no primary, a primary only another member sees, same name in two clusters
+    interval: 1m
+    input_series:
+      - series: mongodb_rs_members_state{rs_nm="a", instance="a1:27017", member_idx="a1:27017", member_state="SECONDARY"}
+        values: 2x10
+      - series: mongodb_rs_members_state{rs_nm="a", instance="a1:27017", member_idx="a2:27017", member_state="SECONDARY"}
+        values: 2x10
+      # b1's own exporter is failing, but b2 sees it as PRIMARY.
+      - series: mongodb_rs_members_state{rs_nm="b", instance="b2:27017", member_idx="b1:27017", member_state="PRIMARY"}
+        values: 1x10
+      - series: mongodb_rs_members_state{rs_nm="b", instance="b2:27017", member_idx="b2:27017", member_state="SECONDARY"}
+        values: 2x10
+      # Two replica sets named c, which cluster_name tells apart; only y lacks
+      # a primary.
+      - series: mongodb_rs_members_state{cluster_name="x", rs_nm="c", instance="x1:27017", member_idx="x1:27017", member_state="PRIMARY"}
+        values: 1x10
+      - series: mongodb_rs_members_state{cluster_name="y", rs_nm="c", instance="y1:27017", member_idx="y1:27017", member_state="SECONDARY"}
+        values: 2x10
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: MongoDBReplicaSetNoPrimary
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              rs_nm: a
+            exp_annotations:
+              description: "No reporting member of a has seen a PRIMARY for a minute, so writes to it fail -- for a shard, writes to the data it owns; for the config servers, chunk migrations and metadata changes. An election normally ends within seconds: check that a majority of the voting members is up and can reach the others."
+              summary: "Replica set a has no primary"
+          - exp_labels:
+              severity: critical
+              cluster_name: y
+              rs_nm: c
+            exp_annotations:
+              description: "No reporting member of c has seen a PRIMARY for a minute, so writes to it fail -- for a shard, writes to the data it owns; for the config servers, chunk migrations and metadata changes. An election normally ends within seconds: check that a majority of the voting members is up and can reach the others."
+              summary: "Replica set c has no primary"
+
+  - name: member health and state
+    interval: 1m
+    input_series:
+      # r1 fails its heartbeats to r2 while r3 still reaches it: unreachable.
+      - series: mongodb_rs_members_health{rs_nm="r", instance="r1:27017", member_idx="r2:27017", member_state="(not reachable/healthy)"}
+        values: 0x10
+      - series: mongodb_rs_members_health{rs_nm="r", instance="r3:27017", member_idx="r2:27017", member_state="SECONDARY"}
+        values: 1x10
+      - series: mongodb_rs_members_health{rs_nm="r", instance="r1:27017", member_idx="r3:27017", member_state="RECOVERING"}
+        values: 1x10
+      # r2 DOWN is the health rule's, not the state rule's.
+      - series: mongodb_rs_members_state{rs_nm="r", instance="r1:27017", member_idx="r2:27017", member_state="(not reachable/healthy)"}
+        values: 8x10
+      - series: mongodb_rs_members_state{rs_nm="r", instance="r1:27017", member_idx="r3:27017", member_state="RECOVERING"}
+        values: 3x10
+      # An arbiter is a normal member.
+      - series: mongodb_rs_members_state{rs_nm="r", instance="r1:27017", member_idx="r4:27017", member_state="ARBITER"}
+        values: 7x10
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: MongoDBReplicaSetMemberUnhealthy
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              rs_nm: r
+              member_idx: r2:27017
+            exp_annotations:
+              description: "A member of r has failed its heartbeats to r2:27017 for 2 minutes: that process is down, or the network between them is. The replica set keeps its primary while a majority of the voting members can reach each other; one more loss may take it away."
+              summary: "r2:27017 in replica set r is unreachable"
+      - eval_time: 6m
+        alertname: MongoDBReplicaSetMemberStateAbnormal
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              rs_nm: r
+              member_idx: r3:27017
+              member_state: RECOVERING
+            exp_annotations:
+              description: "r3:27017 has been RECOVERING for 5 minutes, so it serves no reads and cannot become primary. STARTUP2 is an initial sync, which takes as long as copying the data; RECOVERING usually means it fell off the end of the oplog and needs a resync; a ROLLBACK undoes writes that never reached a majority. Its mongod log says which."
+              summary: "r3:27017 in replica set r is RECOVERING"
+
+  - name: replication lag and elections
+    interval: 1m
+    input_series:
+      - series: mongodb_mongod_replset_member_replication_lag{set="s", name="s2:27017", instance="s1:27017", self="0", state="SECONDARY"}
+        values: 30x110
+      # Within the threshold.
+      - series: mongodb_mongod_replset_member_replication_lag{set="s", name="s3:27017", instance="s1:27017", self="0", state="SECONDARY"}
+        values: 5x110
+      - series: mongodb_rs_term{rs_nm="s", instance="s1:27017"}
+        values: 5x69 6x40
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: MongoDBReplicationLagging
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              set: s
+              name: s2:27017
+            exp_annotations:
+              description: "For 5 minutes s2:27017 has been more than 10 seconds behind the primary of s. Reads from it are stale, writes with a majority write concern wait for it when too few members keep up, and it cannot be elected until it catches up. A slow disk, an overloaded secondary or a flood of writes are the usual causes."
+              summary: "s2:27017 is 30s behind the primary of s"
+      - eval_time: 75m
+        alertname: MongoDBReplicaSetElection
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              rs_nm: s
+            exp_annotations:
+              description: "s moved to term 6 within the last 10 minutes: a primary stepped down, failed, or lost touch with a majority. A planned stepdown needs no action; for an unplanned one, find the cause in the old primary's mongod log."
+              summary: "Replica set s held an election"
+      # The new term is older than the 10-minute window by now.
+      - eval_time: 90m
+        alertname: MongoDBReplicaSetElection
+        exp_alerts: []
+
+  - name: oplog window
+    interval: 1m
+    input_series:
+      - series: mongodb_mongod_replset_oplog_head_timestamp{instance="o1:27017"}
+        values: 100000x70
+      - series: mongodb_mongod_replset_oplog_tail_timestamp{instance="o1:27017"}
+        values: 92800x70
+      - series: mongodb_mongod_replset_oplog_head_timestamp{instance="o2:27017"}
+        values: 100000x70
+      - series: mongodb_mongod_replset_oplog_tail_timestamp{instance="o2:27017"}
+        values: 98200x70
+      # Over a day.
+      - series: mongodb_mongod_replset_oplog_head_timestamp{instance="o3:27017"}
+        values: 300000x70
+      - series: mongodb_mongod_replset_oplog_tail_timestamp{instance="o3:27017"}
+        values: 100000x70
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: MongoDBOplogWindowShort
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              instance: o2:27017
+            exp_annotations:
+              description: "The oplog on o2:27017 spans 30m 0s of writes. A member away for longer than that -- down for maintenance, say -- cannot catch up and has to resync all of its data. Grow the oplog (replSetResizeOplog) or set a minimum retention period."
+              summary: "The oplog on o2:27017 holds only 30m 0s"
+      - eval_time: 61m
+        alertname: MongoDBOplogWindowShort
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: o1:27017
+            exp_annotations:
+              description: "The oplog on o1:27017 spans 2h 0m 0s of writes. A member away for longer than that -- down for maintenance, say -- cannot catch up and has to resync all of its data. Grow the oplog (replSetResizeOplog) or set a minimum retention period."
+              summary: "The oplog on o1:27017 holds only 2h 0m 0s"
+          - exp_labels:
+              severity: warning
+              instance: o2:27017
+            exp_annotations:
+              description: "The oplog on o2:27017 spans 30m 0s of writes. A member away for longer than that -- down for maintenance, say -- cannot catch up and has to resync all of its data. Grow the oplog (replSetResizeOplog) or set a minimum retention period."
+              summary: "The oplog on o2:27017 holds only 30m 0s"
+          - exp_labels:
+              severity: critical
+              instance: o2:27017
+            exp_annotations:
+              description: "The oplog on o2:27017 spans 30m 0s of writes. A member away for longer than that -- down for maintenance, say -- cannot catch up and has to resync all of its data. Grow the oplog (replSetResizeOplog) or set a minimum retention period."
+              summary: "The oplog on o2:27017 holds only 30m 0s"
+
+  - name: connections, tickets, cache, asserts
+    interval: 1m
+    input_series:
+      - series: mongodb_connections{instance="c1:27017", state="current"}
+        values: 90x10
+      - series: mongodb_connections{instance="c1:27017", state="available"}
+        values: 10x10
+      - series: mongodb_connections{instance="c2:27017", state="current"}
+        values: 97x10
+      - series: mongodb_connections{instance="c2:27017", state="available"}
+        values: 3x10
+      - series: mongodb_mongod_wiredtiger_concurrent_transactions_available_tickets{instance="t1:27017", txn_rw="write"}
+        values: 0x10
+      # Tickets left.
+      - series: mongodb_mongod_wiredtiger_concurrent_transactions_available_tickets{instance="t1:27017", txn_rw="read"}
+        values: 5x10
+      - series: mongodb_ss_wt_cache_tracked_dirty_bytes_in_the_cache{instance="d1:27017"}
+        values: 25x15
+      - series: mongodb_ss_wt_cache_bytes_currently_in_the_cache{instance="d1:27017"}
+        values: 96x15
+      - series: mongodb_ss_wt_cache_maximum_bytes_configured{instance="d1:27017"}
+        values: 100x15
+      - series: mongodb_asserts_total{instance="a1:27017", type="regular"}
+        values: 0+2x20
+      # Client errors, not the server's.
+      - series: mongodb_asserts_total{instance="a1:27017", type="user"}
+        values: 0+100x20
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: MongoDBConnectionsNearLimit
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: c1:27017
+            exp_annotations:
+              description: "At its connection limit MongoDB refuses new connections. Find the client holding the most (db.currentOp or the connection log lines) and check its connection pool size."
+              summary: "MongoDB on c1:27017 is using 90% of its connections"
+          - exp_labels:
+              severity: warning
+              instance: c2:27017
+            exp_annotations:
+              description: "At its connection limit MongoDB refuses new connections. Find the client holding the most (db.currentOp or the connection log lines) and check its connection pool size."
+              summary: "MongoDB on c2:27017 is using 97% of its connections"
+          - exp_labels:
+              severity: critical
+              instance: c2:27017
+            exp_annotations:
+              description: "At its connection limit MongoDB refuses new connections. Find the client holding the most (db.currentOp or the connection log lines) and check its connection pool size."
+              summary: "MongoDB on c2:27017 is using 97% of its connections"
+      - eval_time: 3m
+        alertname: MongoDBTicketsExhausted
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: t1:27017
+              txn_rw: write
+            exp_annotations:
+              description: "For 2 minutes every write ticket on t1:27017 has been in use, so further operations queue and latency climbs. Usually slow operations hold them: look for collection scans and long operations in db.currentOp, and at the disk under the data directory."
+              summary: "MongoDB on t1:27017 has no write tickets left"
+      - eval_time: 6m
+        alertname: MongoDBCacheDirtyHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: d1:27017
+            exp_annotations:
+              description: "Above 20% dirty, WiredTiger has application threads evict pages themselves, which slows every write. The disk cannot keep up with the write load: check its latency and the checkpoint durations."
+              summary: "Dirty data fills 25% of the WiredTiger cache on d1:27017"
+      - eval_time: 11m
+        alertname: MongoDBCacheFull
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: d1:27017
+            exp_annotations:
+              description: "Above 95% WiredTiger has application threads evict pages, which slows reads and writes alike. The working set no longer fits the cache: give mongod more memory (the cache defaults to half of RAM minus 1 GB, or of the container's limit), or make the queries touch less data."
+              summary: "The WiredTiger cache on d1:27017 is 96% full"
+      - eval_time: 6m
+        alertname: MongoDBRegularAsserts
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: a1:27017
+              type: regular
+            exp_annotations:
+              description: "a1:27017 raised 10 regular asserts in 5 minutes: internal errors, which point at a server problem rather than at a client. Its mongod log records each with a stack trace."
+              summary: "MongoDB on a1:27017 raised regular asserts"
+
+  - name: balancer
+    interval: 1m
+    input_series:
+      - series: mongodb_mongos_sharding_balancer_enabled{cluster_name="k", instance="m1:27017"}
+        values: 0x400
+      - series: mongodb_mongos_sharding_balancer_enabled{cluster_name="k", instance="m2:27017"}
+        values: 0x400
+      # One router of j still reports the balancer on.
+      - series: mongodb_mongos_sharding_balancer_enabled{cluster_name="j", instance="m3:27017"}
+        values: 1x400
+      - series: mongodb_mongos_sharding_balancer_enabled{cluster_name="j", instance="m4:27017"}
+        values: 0x400
+    alert_rule_test:
+      - eval_time: 300m
+        alertname: MongoDBBalancerDisabled
+        exp_alerts: []
+      - eval_time: 361m
+        alertname: MongoDBBalancerDisabled
+        exp_alerts:
+          - exp_labels:
+              severity: info
+              cluster_name: k
+            exp_annotations:
+              description: "With the balancer off, chunks are not moved between shards, so new data piles up where it lands. Backups and maintenance turn it off on purpose; if nothing is running, sh.startBalancer() turns it back on."
+              summary: "The sharding balancer of k has been off for 6 hours"

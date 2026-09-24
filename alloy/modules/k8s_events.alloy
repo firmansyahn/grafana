@@ -1,129 +1,131 @@
 declare "kubernetes" {
-    argument "cluster_name" {}
-    argument "forward_to" {
-        comment = "Must be a list(LogsReceiver) where collected logs should be forwarded to"
-    }
-    argument "job_label" {
-        comment = "The job label to add for all cadvisor metric (default: integrations/kubernetes/eventhandler)"
-        optional = true
-    }
-    argument "log_format" {
-        comment = " (default: json)"
-        optional = true
-    }
-    argument "tenant_id" {}
+	argument "cluster_name" { }
 
-    argument "drop_normal_events" {
-        default = true
-        optional = true
-    }
+	argument "forward_to" {
+		comment = "Must be a list(LogsReceiver) where collected logs should be forwarded to"
+	}
 
-    loki.source.kubernetes_events "cluster_events" {
-        job_name   = coalesce(argument.job_label.value, "integrations/kubernetes/eventhandler")
-        log_format = coalesce(argument.job_label.value, "json")
-        forward_to = [
-            loki.process.cluster_events.receiver,
-        ]
-    }
+	argument "job_label" {
+		comment  = "The job label to add for all cadvisor metric (default: integrations/kubernetes/eventhandler)"
+		optional = true
+	}
 
-    loki.process "cluster_events" {
-        forward_to = argument.forward_to.value
+	argument "log_format" {
+		comment  = " (default: json)"
+		optional = true
+	}
 
-        stage.match {
-            selector = "{job=\"integrations/kubernetes/eventhandler\"}"
-            pipeline_name = "try_json"
+	argument "tenant_id" { }
 
-            stage.json {
-                expressions = {
-                    reason        = "reason",
-                    message       = "message",
-                    type          = "type",
-                    namespace     = "metadata.namespace",
-                    name          = "metadata.name",
-                    uid           = "metadata.uid",
-                    creation_ts   = "metadata.creationTimestamp",
+	argument "drop_normal_events" {
+		default  = true
+		optional = true
+	}
 
-                    involved_kind = "involvedObject.kind",
-                    involved_name = "involvedObject.name",
-                    involved_ns   = "involvedObject.namespace",
-                    involved_uid  = "involvedObject.uid",
+	loki.source.kubernetes_events "cluster_events" {
+		job_name   = coalesce(argument.job_label.value, "integrations/kubernetes/eventhandler")
+		log_format = coalesce(argument.job_label.value, "json")
+		forward_to = [
+			loki.process.cluster_events.receiver,
+		]
+	}
 
-                    source        = "source.component",
-                    node          = "source.host",
-                    reporting     = "reportingComponent",
-                    count         = "count",
-                }
-            }
-        }
+	loki.process "cluster_events" {
+		forward_to = argument.forward_to.value
 
-        //stage.logfmt {
-        //    mapping = {
-        //        type      = "type",
-        //        reason    = "reason",
-        //        namespace = "namespace",
-        //        kind      = "kind",
-        //        source    = "sourcecomponent",
-        //        node      = "name",
-        //        message   = "msg",
-        //        count     = "count",
-        //    }
-        //}
+		stage.match {
+			selector      = "{job=\"integrations/kubernetes/eventhandler\"}"
+			pipeline_name = "try_json"
 
-        stage.match {
-            selector = "{type=\"Normal\"}"
-            action   = "drop"
-            drop_counter_reason = "normal_events"
-        }
+			stage.json {
+				expressions = {
+					reason        = "reason",
+					message       = "message",
+					type          = "type",
+					namespace     = "metadata.namespace",
+					name          = "metadata.name",
+					uid           = "metadata.uid",
+					creation_ts   = "metadata.creationTimestamp",
+					involved_kind = "involvedObject.kind",
+					involved_name = "involvedObject.name",
+					involved_ns   = "involvedObject.namespace",
+					involved_uid  = "involvedObject.uid",
+					source        = "source.component",
+					node          = "source.host",
+					reporting     = "reportingComponent",
+					count         = "count",
+				}
+			}
+		}
 
-        stage.template {
-            source   = "severity"
-            template = "{{`{{`}} if eq .type \"Warning\" {{`}}`}}warning{{`{{`}} else {{`}}`}}info{{`{{`}} end {{`}}`}}"
-        }
+		//stage.logfmt {
+		//    mapping = {
+		//        type      = "type",
+		//        reason    = "reason",
+		//        namespace = "namespace",
+		//        kind      = "kind",
+		//        source    = "sourcecomponent",
+		//        node      = "name",
+		//        message   = "msg",
+		//        count     = "count",
+		//    }
+		//}
 
-        stage.template {
-            source = "incident"
-            template = "{{`{{`}} if eq .reason \"BackOff\" {{`}}`}}crashloop{{`{{`}} else if or (eq .reason \"NodeNotReady\") (eq .reason \"NodeHasDiskPressure\") (eq .reason \"NodeHasMemoryPressure\") {{`}}`}}node-pressure{{`{{`}} else }}none{{`{{`}} end {{`}}`}}"
-        }
+		stage.match {
+			selector            = "{type=\"Normal\"}"
+			action              = "drop"
+			drop_counter_reason = "normal_events"
+		}
 
-        stage.template {
-            source = "alert_group"
-            template = "{{`{{`}} .namespace {{`}}`}}-{{`{{`}} .reason {{`}}`}}"
-        }
+		stage.template {
+			source   = "severity"
+			template = "{{`{{`}} if eq .type \"Warning\" {{`}}`}}warning{{`{{`}} else {{`}}`}}info{{`{{`}} end {{`}}`}}"
+		}
 
-        stage.template {
-            source = "log"
-            template = "{{`{{`}} .creation_ts {{`}}`}} [{{`{{`}} .severity | upper {{`}}`}}] {{`{{`}} .namespace }}/{{`{{`}} .involved_kind {{`}}`}}: {{`{{`}} .reason {{`}}`}} - {{`{{`}} .message {{`}}`}}"
-        }
+		stage.template {
+			source   = "incident"
+			template = "{{`{{`}} if eq .reason \"BackOff\" {{`}}`}}crashloop{{`{{`}} else if or (eq .reason \"NodeNotReady\") (eq .reason \"NodeHasDiskPressure\") (eq .reason \"NodeHasMemoryPressure\") {{`}}`}}node-pressure{{`{{`}} else }}none{{`{{`}} end {{`}}`}}"
+		}
 
-        // Promote extracted fields to labels
-        stage.labels {
-            values = {
-                type      = "type",             // Normal or Warning
-                reason    = "reason",           // e.g. BackOff, Pulled, Scheduled
-                namespace = "involved_ns",
-                kind      = "involved_kind",    // e.g. Pod, Deployment
-                source    = "source",           // e.g. kubelet, default-scheduler
-                node      = "node",
-            }
-        }
+		stage.template {
+			source   = "alert_group"
+			template = "{{`{{`}} .namespace {{`}}`}}-{{`{{`}} .reason {{`}}`}}"
+		}
 
-        stage.label_drop {
-            values = [
-                "uid",
-                "name",
-                "involved_uid",
-                "involved_name",
-            ]
-        }
+		stage.template {
+			source   = "log"
+			template = "{{`{{`}} .creation_ts {{`}}`}} [{{`{{`}} .severity | upper {{`}}`}}] {{`{{`}} .namespace }}/{{`{{`}} .involved_kind {{`}}`}}: {{`{{`}} .reason {{`}}`}} - {{`{{`}} .message {{`}}`}}"
+		}
 
-        stage.static_labels {
-            values = {
-                cluster_name = argument.cluster_name.value,
-            }
-        }
+		// Promote extracted fields to labels
+		stage.labels {
+			values = {
+				type      = "type",   // Normal or Warning
+				reason    = "reason", // e.g. BackOff, Pulled, Scheduled
+				namespace = "involved_ns",
+				kind      = "involved_kind", // e.g. Pod, Deployment
+				source    = "source",        // e.g. kubelet, default-scheduler
+				node      = "node",
+			}
+		}
 
-        stage.tenant {
-            value = argument.tenant_id.value
-        }
-    }
+		stage.label_drop {
+			values = [
+				"uid",
+				"name",
+				"involved_uid",
+				"involved_name",
+			]
+		}
+
+		stage.static_labels {
+			values = {
+				cluster_name = argument.cluster_name.value,
+			}
+		}
+
+		stage.tenant {
+			value = argument.tenant_id.value
+		}
+	}
 }

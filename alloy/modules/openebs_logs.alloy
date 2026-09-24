@@ -1,22 +1,24 @@
 declare "log" {
+	argument "forward_to" {
+		comment = "Must be a list(LogsReceiver) where collected logs should be forwarded to"
+	}
 
-    argument "forward_to" {
-        comment = "Must be a list(LogsReceiver) where collected logs should be forwarded to"
-    }
+	loki.process "openebs_process_logs" {
+		forward_to = argument.forward_to.value
 
-    loki.process "openebs_process_logs" {
-        forward_to = argument.forward_to.value
+		stage.docker { }
 
-        stage.docker { }
-        stage.replace {
-            expression = "(\\n)"
-            replace = ""
-        }
-        stage.multiline {
-            firstline = "^  \\x1b\\[2m(\\d{4})-(\\d{2})-(\\d{2})T(\\d{2}):(\\d{2}):(\\d{2}).(\\d{6})Z"
-        }
-        stage.multiline {
-            firstline = "^  (\\d{4})-(\\d{2})-(\\d{2})T(\\d{2}):(\\d{2}):(\\d{2}).(\\d{6})Z"
-        }
-    }
+		stage.replace {
+			expression = "(\\n)"
+			replace    = ""
+		}
+
+		stage.multiline {
+			firstline = "^  \\x1b\\[2m(\\d{4})-(\\d{2})-(\\d{2})T(\\d{2}):(\\d{2}):(\\d{2}).(\\d{6})Z"
+		}
+
+		stage.multiline {
+			firstline = "^  (\\d{4})-(\\d{2})-(\\d{2})T(\\d{2}):(\\d{2}):(\\d{2}).(\\d{6})Z"
+		}
+	}
 }

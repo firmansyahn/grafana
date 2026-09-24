@@ -160,11 +160,13 @@ declare "postgres" {
 		comment  = "list(MetricsReceiver) to send metrics to INSTEAD of the embedded remote_write: another declare's exported receiver, to share one remote_write, or your own prometheus.relabel (default: unset, use the embedded remote_write)"
 		optional = true
 	}
+
 	argument "tenant_id" {
 		comment  = "The tenant (X-Scope-OrgID) for the embedded remote_write. Required unless forward_to is set."
 		optional = true
 		default  = ""
 	}
+
 	argument "endpoint_url" {
 		comment  = "Prometheus-compatible remote_write URL (e.g. Mimir) for the embedded writer. Required unless forward_to is set; the default points at a local Mimir so a misconfiguration fails loudly with connection errors rather than silently discarding metrics."
 		optional = true
@@ -178,6 +180,7 @@ declare "postgres" {
 		optional = true
 		default  = ""
 	}
+
 	argument "endpoint_basic_auth_password" {
 		comment  = "Basic-auth password for the embedded remote_write (default: \"\", no credentials)"
 		optional = true
@@ -189,21 +192,25 @@ declare "postgres" {
 		comment  = "Node name for the instance/node labels (default: sys.env(\"K8S_NODE_NAME\"), else the hostname)"
 		optional = true
 	}
+
 	argument "enabled_collectors" {
 		comment  = "Collectors to run (default: [], the exporter's default set: database, locks, replication, replication_slot, roles, stat_bgwriter, stat_database, stat_progress_vacuum, stat_user_tables, statio_user_tables, wal). A non-empty list REPLACES that set rather than adding to it, so to add one, list the defaults plus it -- e.g. the defaults plus \"stat_checkpointer\" on PostgreSQL 17+, and \"long_running_transactions\" for the age of the oldest open transaction."
 		optional = true
 		default  = []
 	}
+
 	argument "disable_settings_metrics" {
 		comment  = "Skip the pg_settings_* series, one per numeric server setting (default: false). They hold max_connections and friends, which utilisation panels divide by."
 		optional = true
 		default  = false
 	}
+
 	argument "custom_queries_config_path" {
 		comment  = "YAML file of extra queries to expose as metrics, in postgres_exporter's queries.yaml format, as seen from inside the collector (default: \"\", none)"
 		optional = true
 		default  = ""
 	}
+
 	argument "scrape_interval" {
 		comment  = "How often to collect (default: \"30s\")"
 		optional = true
@@ -216,19 +223,23 @@ declare "postgres" {
 		optional = true
 		default  = "10s"
 	}
+
 	argument "job_name" {
 		comment  = "Value for the job label (default: \"integrations/postgres\", the exporter's own)"
 		optional = true
 		default  = "integrations/postgres"
 	}
+
 	argument "region" {
 		comment  = "Value for the region external label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "zone" {
 		comment  = "Value for the zone external label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "cluster_name" {
 		comment  = "Value for the cluster_name external label (default: \"\", unset)"
 		optional = true
@@ -258,6 +269,7 @@ declare "postgres" {
 			target_label = "instance"
 			replacement  = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"), constants.hostname)
 		}
+
 		rule {
 			target_label = "node"
 			replacement  = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"), constants.hostname)
@@ -352,21 +364,25 @@ declare "patroni" {
 		comment  = "list(MetricsReceiver) to send metrics to INSTEAD of the embedded remote_write: another declare's exported receiver, to share one remote_write, or your own prometheus.relabel (default: unset, use the embedded remote_write)"
 		optional = true
 	}
+
 	argument "tenant_id" {
 		comment  = "The tenant (X-Scope-OrgID) for the embedded remote_write. Required unless forward_to is set."
 		optional = true
 		default  = ""
 	}
+
 	argument "endpoint_url" {
 		comment  = "Prometheus-compatible remote_write URL (e.g. Mimir) for the embedded writer. Required unless forward_to is set; the default points at a local Mimir so a misconfiguration fails loudly."
 		optional = true
 		default  = "http://localhost:9009/api/v1/push"
 	}
+
 	argument "endpoint_basic_auth_username" {
 		comment  = "Basic-auth username for the embedded remote_write (default: \"\", no credentials)"
 		optional = true
 		default  = ""
 	}
+
 	argument "endpoint_basic_auth_password" {
 		comment  = "Basic-auth password for the embedded remote_write (default: \"\", no credentials)"
 		optional = true
@@ -379,31 +395,37 @@ declare "patroni" {
 		optional = true
 		default  = "127.0.0.1:8008"
 	}
+
 	argument "scheme" {
 		comment  = "\"http\" (default) or \"https\" -- https whenever restapi.certfile is set, since Patroni then serves TLS only"
 		optional = true
 		default  = "http"
 	}
+
 	argument "ca_file" {
 		comment  = "CA bundle to verify the REST API certificate against, as a path inside the collector (default: \"\", the system roots)"
 		optional = true
 		default  = ""
 	}
+
 	argument "cert_file" {
 		comment  = "Client certificate, only needed when restapi.verify_client is \"required\" (default: \"\", none)"
 		optional = true
 		default  = ""
 	}
+
 	argument "key_file" {
 		comment  = "Key for cert_file (default: \"\", none)"
 		optional = true
 		default  = ""
 	}
+
 	argument "server_name" {
 		comment  = "Name to verify the certificate against when address is not among its SANs, e.g. the node's hostname when scraping over 127.0.0.1 (default: \"\", the host in address)"
 		optional = true
 		default  = ""
 	}
+
 	argument "insecure_skip_verify" {
 		comment  = "Skip certificate verification (default: false)"
 		optional = true
@@ -415,33 +437,40 @@ declare "patroni" {
 		comment  = "Node name for the instance/node labels (default: sys.env(\"K8S_NODE_NAME\"), else the hostname)"
 		optional = true
 	}
+
 	argument "scrape_interval" {
 		comment  = "How often to scrape (default: \"30s\")"
 		optional = true
 		default  = "30s"
 	}
+
 	argument "scrape_timeout" {
 		comment  = "Scrape timeout (default: \"10s\")"
 		optional = true
 		default  = "10s"
 	}
+
 	argument "job_name" {
 		comment  = "Value for the job label (default: \"integrations/patroni\")"
 		optional = true
 		default  = "integrations/patroni"
 	}
+
 	argument "region" {
 		comment  = "Value for the region external label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "zone" {
 		comment  = "Value for the zone external label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "cluster_name" {
 		comment  = "Value for the cluster_name external label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "external_labels" {
 		comment  = "Complete external_labels map for the embedded remote_write, REPLACING the region/zone/cluster_name defaults (default: unset, which keeps them)"
 		optional = true
@@ -568,21 +597,25 @@ declare "etcd" {
 		comment  = "list(MetricsReceiver) to send metrics to INSTEAD of the embedded remote_write: another declare's exported receiver, to share one remote_write, or your own prometheus.relabel (default: unset, use the embedded remote_write)"
 		optional = true
 	}
+
 	argument "tenant_id" {
 		comment  = "The tenant (X-Scope-OrgID) for the embedded remote_write. Required unless forward_to is set."
 		optional = true
 		default  = ""
 	}
+
 	argument "endpoint_url" {
 		comment  = "Prometheus-compatible remote_write URL (e.g. Mimir) for the embedded writer. Required unless forward_to is set; the default points at a local Mimir so a misconfiguration fails loudly."
 		optional = true
 		default  = "http://localhost:9009/api/v1/push"
 	}
+
 	argument "endpoint_basic_auth_username" {
 		comment  = "Basic-auth username for the embedded remote_write (default: \"\", no credentials)"
 		optional = true
 		default  = ""
 	}
+
 	argument "endpoint_basic_auth_password" {
 		comment  = "Basic-auth password for the embedded remote_write (default: \"\", no credentials)"
 		optional = true
@@ -595,31 +628,37 @@ declare "etcd" {
 		optional = true
 		default  = "127.0.0.1:2379"
 	}
+
 	argument "scheme" {
 		comment  = "\"http\" (default) or \"https\""
 		optional = true
 		default  = "http"
 	}
+
 	argument "ca_file" {
 		comment  = "CA bundle to verify etcd's certificate against, as a path inside the collector (default: \"\", the system roots)"
 		optional = true
 		default  = ""
 	}
+
 	argument "cert_file" {
 		comment  = "Client certificate for a client port running --client-cert-auth (default: \"\", none). Read the header before using one."
 		optional = true
 		default  = ""
 	}
+
 	argument "key_file" {
 		comment  = "Key for cert_file (default: \"\", none)"
 		optional = true
 		default  = ""
 	}
+
 	argument "server_name" {
 		comment  = "Name to verify the certificate against when address is not among its SANs (default: \"\", the host in address)"
 		optional = true
 		default  = ""
 	}
+
 	argument "insecure_skip_verify" {
 		comment  = "Skip certificate verification (default: false)"
 		optional = true
@@ -631,33 +670,40 @@ declare "etcd" {
 		comment  = "Node name for the instance/node labels (default: sys.env(\"K8S_NODE_NAME\"), else the hostname)"
 		optional = true
 	}
+
 	argument "scrape_interval" {
 		comment  = "How often to scrape (default: \"30s\")"
 		optional = true
 		default  = "30s"
 	}
+
 	argument "scrape_timeout" {
 		comment  = "Scrape timeout (default: \"10s\")"
 		optional = true
 		default  = "10s"
 	}
+
 	argument "job_name" {
 		comment  = "Value for the job label (default: \"integrations/etcd\"). etcd's upstream alerting mixin selects job=~\".*etcd.*\", which this matches."
 		optional = true
 		default  = "integrations/etcd"
 	}
+
 	argument "region" {
 		comment  = "Value for the region external label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "zone" {
 		comment  = "Value for the zone external label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "cluster_name" {
 		comment  = "Value for the cluster_name external label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "external_labels" {
 		comment  = "Complete external_labels map for the embedded remote_write, REPLACING the region/zone/cluster_name defaults (default: unset, which keeps them)"
 		optional = true
@@ -762,21 +808,25 @@ declare "haproxy" {
 		comment  = "list(MetricsReceiver) to send metrics to INSTEAD of the embedded remote_write: another declare's exported receiver, to share one remote_write, or your own prometheus.relabel (default: unset, use the embedded remote_write)"
 		optional = true
 	}
+
 	argument "tenant_id" {
 		comment  = "The tenant (X-Scope-OrgID) for the embedded remote_write. Required unless forward_to is set."
 		optional = true
 		default  = ""
 	}
+
 	argument "endpoint_url" {
 		comment  = "Prometheus-compatible remote_write URL (e.g. Mimir) for the embedded writer. Required unless forward_to is set; the default points at a local Mimir so a misconfiguration fails loudly."
 		optional = true
 		default  = "http://localhost:9009/api/v1/push"
 	}
+
 	argument "endpoint_basic_auth_username" {
 		comment  = "Basic-auth username for the embedded remote_write (default: \"\", no credentials)"
 		optional = true
 		default  = ""
 	}
+
 	argument "endpoint_basic_auth_password" {
 		comment  = "Basic-auth password for the embedded remote_write (default: \"\", no credentials)"
 		optional = true
@@ -789,36 +839,43 @@ declare "haproxy" {
 		optional = true
 		default  = "127.0.0.1:8404"
 	}
+
 	argument "metrics_path" {
 		comment  = "Path the frontend routes to the exporter (default: \"/metrics\")"
 		optional = true
 		default  = "/metrics"
 	}
+
 	argument "scheme" {
 		comment  = "\"http\" (default) or \"https\""
 		optional = true
 		default  = "http"
 	}
+
 	argument "ca_file" {
 		comment  = "CA bundle to verify the frontend's certificate against, as a path inside the collector (default: \"\", the system roots)"
 		optional = true
 		default  = ""
 	}
+
 	argument "cert_file" {
 		comment  = "Client certificate, if the frontend demands one (default: \"\", none)"
 		optional = true
 		default  = ""
 	}
+
 	argument "key_file" {
 		comment  = "Key for cert_file (default: \"\", none)"
 		optional = true
 		default  = ""
 	}
+
 	argument "server_name" {
 		comment  = "Name to verify the certificate against when address is not among its SANs (default: \"\", the host in address)"
 		optional = true
 		default  = ""
 	}
+
 	argument "insecure_skip_verify" {
 		comment  = "Skip certificate verification (default: false)"
 		optional = true
@@ -830,33 +887,40 @@ declare "haproxy" {
 		comment  = "Node name for the instance/node labels (default: sys.env(\"K8S_NODE_NAME\"), else the hostname)"
 		optional = true
 	}
+
 	argument "scrape_interval" {
 		comment  = "How often to scrape (default: \"30s\")"
 		optional = true
 		default  = "30s"
 	}
+
 	argument "scrape_timeout" {
 		comment  = "Scrape timeout (default: \"10s\")"
 		optional = true
 		default  = "10s"
 	}
+
 	argument "job_name" {
 		comment  = "Value for the job label (default: \"integrations/haproxy\")"
 		optional = true
 		default  = "integrations/haproxy"
 	}
+
 	argument "region" {
 		comment  = "Value for the region external label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "zone" {
 		comment  = "Value for the zone external label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "cluster_name" {
 		comment  = "Value for the cluster_name external label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "external_labels" {
 		comment  = "Complete external_labels map for the embedded remote_write, REPLACING the region/zone/cluster_name defaults (default: unset, which keeps them)"
 		optional = true
@@ -965,21 +1029,25 @@ declare "pgbouncer" {
 		comment  = "list(MetricsReceiver) to send metrics to INSTEAD of the embedded remote_write: another declare's exported receiver, to share one remote_write, or your own prometheus.relabel (default: unset, use the embedded remote_write)"
 		optional = true
 	}
+
 	argument "tenant_id" {
 		comment  = "The tenant (X-Scope-OrgID) for the embedded remote_write. Required unless forward_to is set."
 		optional = true
 		default  = ""
 	}
+
 	argument "endpoint_url" {
 		comment  = "Prometheus-compatible remote_write URL (e.g. Mimir) for the embedded writer. Required unless forward_to is set; the default points at a local Mimir so a misconfiguration fails loudly."
 		optional = true
 		default  = "http://localhost:9009/api/v1/push"
 	}
+
 	argument "endpoint_basic_auth_username" {
 		comment  = "Basic-auth username for the embedded remote_write (default: \"\", no credentials)"
 		optional = true
 		default  = ""
 	}
+
 	argument "endpoint_basic_auth_password" {
 		comment  = "Basic-auth password for the embedded remote_write (default: \"\", no credentials)"
 		optional = true
@@ -992,31 +1060,37 @@ declare "pgbouncer" {
 		optional = true
 		default  = "127.0.0.1:9127"
 	}
+
 	argument "scheme" {
 		comment  = "\"http\" (default) or \"https\", for an exporter started with a --web.config.file that enables TLS"
 		optional = true
 		default  = "http"
 	}
+
 	argument "ca_file" {
 		comment  = "CA bundle to verify the exporter's certificate against, as a path inside the collector (default: \"\", the system roots)"
 		optional = true
 		default  = ""
 	}
+
 	argument "cert_file" {
 		comment  = "Client certificate, if the exporter demands one (default: \"\", none)"
 		optional = true
 		default  = ""
 	}
+
 	argument "key_file" {
 		comment  = "Key for cert_file (default: \"\", none)"
 		optional = true
 		default  = ""
 	}
+
 	argument "server_name" {
 		comment  = "Name to verify the certificate against when address is not among its SANs (default: \"\", the host in address)"
 		optional = true
 		default  = ""
 	}
+
 	argument "insecure_skip_verify" {
 		comment  = "Skip certificate verification (default: false)"
 		optional = true
@@ -1028,33 +1102,40 @@ declare "pgbouncer" {
 		comment  = "Node name for the instance/node labels (default: sys.env(\"K8S_NODE_NAME\"), else the hostname)"
 		optional = true
 	}
+
 	argument "scrape_interval" {
 		comment  = "How often to scrape (default: \"30s\")"
 		optional = true
 		default  = "30s"
 	}
+
 	argument "scrape_timeout" {
 		comment  = "Scrape timeout (default: \"10s\")"
 		optional = true
 		default  = "10s"
 	}
+
 	argument "job_name" {
 		comment  = "Value for the job label (default: \"integrations/pgbouncer\")"
 		optional = true
 		default  = "integrations/pgbouncer"
 	}
+
 	argument "region" {
 		comment  = "Value for the region external label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "zone" {
 		comment  = "Value for the zone external label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "cluster_name" {
 		comment  = "Value for the cluster_name external label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "external_labels" {
 		comment  = "Complete external_labels map for the embedded remote_write, REPLACING the region/zone/cluster_name defaults (default: unset, which keeps them)"
 		optional = true

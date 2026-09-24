@@ -22,7 +22,7 @@
     "list": [
       {
         "name": "datasource",
-        "label": "Loki datasource",
+        "label": "Data source",
         "type": "datasource",
         "query": "loki",
         "current": {
@@ -196,7 +196,7 @@
             "type": "loki",
             "uid": "${datasource}"
           },
-          "expr": "sum(count_over_time({job=~\"${job:regex}\", node=~\"${node:regex}\", app=~\"${app:regex}\", level=~\"${level:regex}\"} |~ \"$search\" [$__range]))",
+          "expr": "sum(count_over_time({job=~\"${job:regex}\", node=~\"${node:regex}\", app=~\"${app:regex}\", level=~\"${level:regex}\"} |~ \"$search\" [$__auto]))",
           "queryType": "instant"
         }
       ],
@@ -255,7 +255,7 @@
             "type": "loki",
             "uid": "${datasource}"
           },
-          "expr": "sum(count_over_time({job=~\"${job:regex}\", node=~\"${node:regex}\", app=~\"${app:regex}\", level=~\"error|critical|fatal\"} |~ \"$search\" [$__range]))",
+          "expr": "sum(count_over_time({job=~\"${job:regex}\", node=~\"${node:regex}\", app=~\"${app:regex}\", level=~\"error|critical|fatal\"} |~ \"$search\" [$__auto]))",
           "queryType": "instant"
         }
       ],
@@ -317,7 +317,7 @@
             "type": "loki",
             "uid": "${datasource}"
           },
-          "expr": "sum(count_over_time({job=~\"${job:regex}\", node=~\"${node:regex}\", app=~\"${app:regex}\", level=\"warn\"} |~ \"$search\" [$__range]))",
+          "expr": "sum(count_over_time({job=~\"${job:regex}\", node=~\"${node:regex}\", app=~\"${app:regex}\", level=\"warn\"} |~ \"$search\" [$__auto]))",
           "queryType": "instant"
         }
       ],
@@ -379,7 +379,7 @@
             "type": "loki",
             "uid": "${datasource}"
           },
-          "expr": "count(sum by (node) (count_over_time({job=~\"${job:regex}\", node=~\"${node:regex}\"} [$__range])))",
+          "expr": "count(sum by (node) (count_over_time({job=~\"${job:regex}\", node=~\"${node:regex}\"} [$__auto])))",
           "queryType": "instant"
         }
       ],
@@ -682,7 +682,7 @@
             "type": "loki",
             "uid": "${datasource}"
           },
-          "expr": "topk(10, sum by (app) (count_over_time({job=~\"${job:regex}\", node=~\"${node:regex}\", app=~\"${app:regex}\", level=~\"${level:regex}\"} |~ \"$search\" [$__range])))",
+          "expr": "topk(10, sum by (app) (count_over_time({job=~\"${job:regex}\", node=~\"${node:regex}\", app=~\"${app:regex}\", level=~\"${level:regex}\"} |~ \"$search\" [$__auto])))",
           "legendFormat": "{{app}}",
           "queryType": "instant"
         }
@@ -733,7 +733,7 @@
             "type": "loki",
             "uid": "${datasource}"
           },
-          "expr": "topk(10, sum by (unit) (count_over_time({job=~\"${job:regex}\", node=~\"${node:regex}\", app=~\"${app:regex}\", level=~\"${level:regex}\"} |~ \"$search\" [$__range])))",
+          "expr": "topk(10, sum by (unit) (count_over_time({job=~\"${job:regex}\", node=~\"${node:regex}\", app=~\"${app:regex}\", level=~\"${level:regex}\"} |~ \"$search\" [$__auto])))",
           "legendFormat": "{{unit}}",
           "queryType": "instant"
         }
@@ -784,7 +784,7 @@
             "type": "loki",
             "uid": "${datasource}"
           },
-          "expr": "sum by (transport) (count_over_time({job=~\"${job:regex}\", node=~\"${node:regex}\", app=~\"${app:regex}\", level=~\"${level:regex}\"} |~ \"$search\" [$__range]))",
+          "expr": "sum by (transport) (count_over_time({job=~\"${job:regex}\", node=~\"${node:regex}\", app=~\"${app:regex}\", level=~\"${level:regex}\"} |~ \"$search\" [$__auto]))",
           "legendFormat": "{{transport}}",
           "queryType": "instant"
         }
@@ -848,7 +848,7 @@
             "type": "loki",
             "uid": "${datasource}"
           },
-          "expr": "sum(count_over_time({job=~\"${job:regex}\", node=~\"${node:regex}\"} |~ \"(?i)(authentication failure|failed password|invalid user|res=failed|failed publickey|not in the sudoers)\" [$__range]))",
+          "expr": "sum(count_over_time({job=~\"${job:regex}\", node=~\"${node:regex}\"} |~ \"(?i)(authentication failure|failed password|invalid user|res=failed|failed publickey|not in the sudoers)\" [$__auto]))",
           "queryType": "instant"
         }
       ],

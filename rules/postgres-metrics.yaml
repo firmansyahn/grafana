@@ -9,7 +9,7 @@
 # same groups with mimirtool:
 #
 #   yq '{"namespace": .metadata.name, "groups": .spec.groups}' \
-#     alerts/postgres-metrics.yaml > postgres-metrics.rules.yaml
+#     rules/postgres-metrics.yaml > postgres-metrics.rules.yaml
 #   mimirtool rules load postgres-metrics.rules.yaml --address=<mimir> --id=<tenant>
 #
 # (plus --user and --key when Mimir sits behind basic auth). Loading rules only
@@ -47,7 +47,7 @@
 # Checked with promtool check rules, and promtool test rules with a firing case
 # for every rule plus the non-firing ones that matter: a member scraped twice, a
 # removed etcd peer, a restart that zeroes the timeline, a renamed job. The tests
-# are in tests/postgres-metrics.test.yaml; alerts/test.sh runs both. Every
+# are in tests/postgres-metrics.test.yaml; rules/test.sh runs both. Every
 # expression was also evaluated in Mimir 3.0 against a live three-node cluster
 # (Patroni 4.1, PostgreSQL 18, etcd 3.6, HAProxy 3.3). The PgBouncer and
 # wraparound rules had no live series there; their metric names come from

@@ -50,18 +50,23 @@ declare "default" {
 	argument "tenant_id" {
 		comment = "The tenant (X-Scope-OrgID) for metrics, logs, and traces"
 	}
+
 	argument "metrics_endpoint" {
 		comment = "Mimir push URL for self-metrics (e.g. https://mimir.../api/v1/push)"
 	}
+
 	argument "logs_endpoint" {
 		comment = "Loki push URL for self-logs (e.g. https://loki.../loki/api/v1/push)"
 	}
+
 	argument "traces_endpoint" {
 		comment = "OTLP gRPC endpoint for self-traces (e.g. tempo...:4317)"
 	}
+
 	argument "basic_auth_username" {
 		comment = "Basic-auth username for metrics and logs endpoints"
 	}
+
 	argument "basic_auth_password" {
 		comment = "Basic-auth password for metrics and logs endpoints"
 	}
@@ -71,10 +76,12 @@ declare "default" {
 		comment  = "Value for the cluster_name external label on metrics, and a static label on logs (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "region" {
 		comment  = "Value for the region external label on metrics, and a static label on logs (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "zone" {
 		comment  = "Value for the zone external label on metrics, and a static label on logs (default: \"\", unset)"
 		optional = true
@@ -139,7 +146,7 @@ declare "default" {
 		// field inside the line, so parse it back out. Requires the caller to
 		// set logging.format = "logfmt" (the default in our configs).
 		stage.logfmt {
-			mapping = { "level" = "level" }
+			mapping = {"level" = "level"}
 		}
 
 		// The map turns "lowest level to keep" into "levels below it".
@@ -159,7 +166,7 @@ declare "default" {
 		// with no level field, extracts "" which matches none of these
 		// patterns and is kept.
 		stage.drop {
-			source = "level"
+			source     = "level"
 			expression = coalesce({
 				"debug" = "^\\x00$",
 				"info"  = "^(debug)$",

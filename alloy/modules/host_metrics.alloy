@@ -52,12 +52,15 @@ declare "unix" {
 	argument "tenant_id" {
 		comment = "The tenant (X-Scope-OrgID) to write node metrics to"
 	}
+
 	argument "endpoint_url" {
 		comment = "Prometheus-compatible remote_write URL (e.g. Mimir)"
 	}
+
 	argument "endpoint_basic_auth_username" {
 		comment = "Basic-auth username for the remote_write endpoint"
 	}
+
 	argument "endpoint_basic_auth_password" {
 		comment = "Basic-auth password for the remote_write endpoint"
 	}
@@ -67,18 +70,22 @@ declare "unix" {
 		comment  = "Node name for the instance/node labels (default: sys.env(\"K8S_NODE_NAME\"), injected by the Alloy Helm chart; outside Kubernetes, the hostname)"
 		optional = true
 	}
+
 	argument "region" {
 		comment  = "Value for the region external label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "zone" {
 		comment  = "Value for the zone external label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "cluster_name" {
 		comment  = "Value for the cluster_name external label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "job_name" {
 		comment  = "Value for the job label (default: \"integrations/unix\", the exporter's own). Set it to keep an existing job label when migrating a hand-written config onto this module, so dashboards and alerts selecting on it keep matching."
 		optional = true
@@ -145,7 +152,7 @@ declare "unix" {
 			// this changes nothing for them.
 			mount_points_exclude = "^/(dev|proc|sys|sysroot|etc|var/lib/docker/.+|var/lib/containers/storage/.+|var/lib/kubelet/.+|run/containerd/.+|run/containers/storage/.+|run/credentials/.+|run/user/[0-9]+/containers/.+|.+/\\.local/share/containers/storage/.+)($|/)"
 			// mount_points_exclude = "^/(dev|proc|sys|var/lib/docker/.+|var/lib/kubelet/.+|run/containerd/io\.containerd\.grpc\.v1\.cri/sandboxes/[a-f0-9]{64}/shm)($|/)"
-			fs_types_exclude     = "^(autofs|binfmt_misc|bpf|cgroup2?|configfs|debugfs|devpts|devtmpfs|fusectl|hugetlbfs|iso9660|mqueue|nsfs|overlay|proc|procfs|pstore|rpc_pipefs|securityfs|selinuxfs|squashfs|sysfs|tracefs)$"
+			fs_types_exclude = "^(autofs|binfmt_misc|bpf|cgroup2?|configfs|debugfs|devpts|devtmpfs|fusectl|hugetlbfs|iso9660|mqueue|nsfs|overlay|proc|procfs|pstore|rpc_pipefs|securityfs|selinuxfs|squashfs|sysfs|tracefs)$"
 		}
 
 		netclass {
@@ -164,6 +171,7 @@ declare "unix" {
 			target_label = "instance"
 			replacement  = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"), constants.hostname)
 		}
+
 		rule {
 			target_label = "node"
 			replacement  = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"), constants.hostname)
@@ -292,12 +300,15 @@ declare "kubelet" {
 	argument "tenant_id" {
 		comment = "The tenant (X-Scope-OrgID) to write kubelet metrics to"
 	}
+
 	argument "endpoint_url" {
 		comment = "Prometheus-compatible remote_write URL (e.g. Mimir)"
 	}
+
 	argument "endpoint_basic_auth_username" {
 		comment = "Basic-auth username for the remote_write endpoint"
 	}
+
 	argument "endpoint_basic_auth_password" {
 		comment = "Basic-auth password for the remote_write endpoint"
 	}
@@ -315,14 +326,17 @@ declare "kubelet" {
 		optional = true
 		default  = true
 	}
+
 	argument "region" {
 		comment  = "Value for the region external label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "zone" {
 		comment  = "Value for the zone external label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "cluster_name" {
 		comment  = "Value for the cluster_name external label (default: \"\", unset)"
 		optional = true
@@ -350,6 +364,7 @@ declare "kubelet" {
 			target_label = "instance"
 			replacement  = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"))
 		}
+
 		rule {
 			target_label = "node"
 			replacement  = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"))
@@ -667,12 +682,15 @@ declare "control_plane" {
 	argument "tenant_id" {
 		comment = "The tenant (X-Scope-OrgID) to write control-plane metrics to"
 	}
+
 	argument "endpoint_url" {
 		comment = "Prometheus-compatible remote_write URL (e.g. Mimir)"
 	}
+
 	argument "endpoint_basic_auth_username" {
 		comment = "Basic-auth username for the remote_write endpoint"
 	}
+
 	argument "endpoint_basic_auth_password" {
 		comment = "Basic-auth password for the remote_write endpoint"
 	}
@@ -689,29 +707,35 @@ declare "control_plane" {
 		optional = true
 		default  = "10257"
 	}
+
 	argument "scheduler_port" {
 		comment  = "kube-scheduler secure port (default: \"10259\")"
 		optional = true
 		default  = "10259"
 	}
+
 	argument "etcd_port" {
 		comment  = "etcd metrics port (default: \"2381\"). Plain HTTP and unauthenticated by design; separate from the client (2379) and peer (2380) mTLS listeners."
 		optional = true
 		default  = "2381"
 	}
+
 	argument "insecure_skip_verify" {
 		comment  = "Skip verification of the components' serving certificates (default: true). kubeadm gives both self-signed certs that the cluster CA does not validate, which is why kube-prometheus-stack also defaults to true."
 		optional = true
 		default  = true
 	}
+
 	argument "region" {
 		comment  = "Value for the region external label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "zone" {
 		comment  = "Value for the zone external label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "cluster_name" {
 		comment  = "Value for the cluster_name external label (default: \"\", unset)"
 		optional = true
@@ -745,6 +769,7 @@ declare "control_plane" {
 			target_label = "instance"
 			replacement  = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"))
 		}
+
 		rule {
 			target_label = "node"
 			replacement  = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"))
@@ -995,12 +1020,15 @@ declare "containers" {
 	argument "tenant_id" {
 		comment = "The tenant (X-Scope-OrgID) to write container metrics to"
 	}
+
 	argument "endpoint_url" {
 		comment = "Prometheus-compatible remote_write URL (e.g. Mimir)"
 	}
+
 	argument "endpoint_basic_auth_username" {
 		comment = "Basic-auth username for the remote_write endpoint"
 	}
+
 	argument "endpoint_basic_auth_password" {
 		comment = "Basic-auth password for the remote_write endpoint"
 	}
@@ -1010,6 +1038,7 @@ declare "containers" {
 		comment  = "Node name for the instance/node labels (default: sys.env(\"K8S_NODE_NAME\"), else the hostname)"
 		optional = true
 	}
+
 	argument "docker_host" {
 		comment  = "Docker Engine endpoint (default: \"unix:///var/run/docker.sock\"). On a Podman-only host leave it: cAdvisor logs that the Docker factory failed to register and carries on. Never Podman's socket -- see the header."
 		optional = true
@@ -1022,18 +1051,22 @@ declare "containers" {
 		optional = true
 		default  = ["com.docker.compose.project", "com.docker.compose.service"]
 	}
+
 	argument "region" {
 		comment  = "Value for the region external label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "zone" {
 		comment  = "Value for the zone external label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "cluster_name" {
 		comment  = "Value for the cluster_name external label (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "job_name" {
 		comment  = "Value for the job label (default: \"integrations/cadvisor\", the exporter's own). Set it to match an existing convention so dashboards and alerts selecting on job keep matching."
 		optional = true
@@ -1070,6 +1103,7 @@ declare "containers" {
 			target_label = "instance"
 			replacement  = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"), constants.hostname)
 		}
+
 		rule {
 			target_label = "node"
 			replacement  = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"), constants.hostname)

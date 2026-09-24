@@ -54,9 +54,11 @@ declare "default" {
 	argument "logs_forward_to" {
 		comment = "list(otelcol.Consumer) the enriched, batched logs signal is forwarded to"
 	}
+
 	argument "traces_forward_to" {
 		comment = "list(otelcol.Consumer) the enriched, batched traces signal is forwarded to"
 	}
+
 	argument "metrics_forward_to" {
 		comment = "list(otelcol.Consumer) the enriched, batched raw OTLP metrics are forwarded to (typically per-tenant routes)"
 	}
@@ -66,18 +68,22 @@ declare "default" {
 		comment  = "Value for the static cluster_name attribute inserted on every signal (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "project_label_key" {
 		comment  = "Pod label key to promote to the project.name resource attribute, e.g. \"app.kubernetes.io/part-of\". Empty disables it (default: \"\")"
 		optional = true
 	}
+
 	argument "node_name" {
 		comment  = "Node whose pods k8sattributes watches/caches. Leave empty for a Deployment gateway (must watch all nodes, since senders are cluster-wide). Under a DaemonSet, pass sys.env(\"K8S_NODE_NAME\") so each pod caches only its own node -- otherwise every pod caches the WHOLE cluster's pod metadata and OOMs at scale (default: \"\", watch all)"
 		optional = true
 	}
+
 	argument "memory_limit_percentage" {
 		comment  = "Hard memory limit for the OTLP receiver, as a percentage of the pod's memory limit; over the soft limit (hard - spike) the receiver drops data and pushes back (default: 80)"
 		optional = true
 	}
+
 	argument "memory_spike_limit_percentage" {
 		comment  = "Spike allowance as a percentage of the pod's memory limit; the soft limit is (memory_limit_percentage - this). Recommended ~20-25% of the hard limit (default: 25)"
 		optional = true
@@ -87,6 +93,7 @@ declare "default" {
 		grpc {
 			endpoint = "0.0.0.0:4317"
 		}
+
 		http {
 			endpoint         = "0.0.0.0:4318"
 			logs_url_path    = "/v1/logs"
@@ -111,9 +118,9 @@ declare "default" {
 	// memory_spike_limit_percentage); above it, data is dropped and the client
 	// is told to back off; above the hard limit a GC is forced.
 	otelcol.processor.memory_limiter "default" {
-		check_interval          = "1s"
-		limit_percentage        = coalesce(argument.memory_limit_percentage.value, 80)
-		spike_limit_percentage  = coalesce(argument.memory_spike_limit_percentage.value, 25)
+		check_interval         = "1s"
+		limit_percentage       = coalesce(argument.memory_limit_percentage.value, 80)
+		spike_limit_percentage = coalesce(argument.memory_spike_limit_percentage.value, 25)
 
 		// All three signals route through k8sattributes so each carries a
 		// server-derived k8s.namespace.name for downstream per-tenant routing.
@@ -264,21 +271,27 @@ declare "tenant_route" {
 	argument "tenant_id" {
 		comment = "The tenant (X-Scope-OrgID) stamped on this route's exported logs and traces"
 	}
+
 	argument "keep_condition" {
 		comment = "OTTL boolean, TRUE for records to drop; matches every namespace except this tenant's, so only this tenant's records survive"
 	}
+
 	argument "logs_endpoint" {
 		comment = "OTLP-HTTP base endpoint for this tenant's logs (e.g. Loki's \"<addr>/otlp\")"
 	}
+
 	argument "traces_endpoint" {
 		comment = "OTLP-HTTP base endpoint for this tenant's traces (e.g. Tempo)"
 	}
+
 	argument "metrics_endpoint" {
 		comment = "Prometheus-compatible remote_write URL (e.g. Mimir) for this tenant's metrics"
 	}
+
 	argument "basic_auth_username" {
 		comment = "Basic-auth username for the logs, traces and metrics endpoints"
 	}
+
 	argument "basic_auth_password" {
 		comment = "Basic-auth password for the logs, traces and metrics endpoints"
 	}
@@ -288,18 +301,22 @@ declare "tenant_route" {
 		comment  = "Value for the region external label on this tenant's metrics (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "zone" {
 		comment  = "Value for the zone external label on this tenant's metrics (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "cluster_name" {
 		comment  = "Value for the cluster_name external label on this tenant's metrics (default: \"\", unset)"
 		optional = true
 	}
+
 	argument "servicegraph_dimensions" {
 		comment  = "Extra span dimensions this tenant's servicegraph connector promotes to labels, using newer OTel HTTP semconv (default: [\"http.request.method\", \"http.route\"])"
 		optional = true
 	}
+
 	argument "spanmetrics_histogram_buckets" {
 		comment  = "Explicit latency histogram bucket boundaries for this tenant's spanmetrics duration metric (default: [\"100ms\", \"250ms\", \"500ms\", \"1s\", \"2.5s\", \"5s\", \"10s\"])"
 		optional = true
@@ -315,6 +332,7 @@ declare "tenant_route" {
 		optional = true
 		default  = 10000
 	}
+
 	argument "spanmetrics_metrics_expiration" {
 		comment  = "Evict a spanmetrics series whose span has not been seen for this long (default: \"5m\"). \"0s\" means never evict, which lets the aggregation map grow without bound."
 		optional = true
@@ -325,9 +343,11 @@ declare "tenant_route" {
 	export "logs_input" {
 		value = otelcol.processor.filter.logs.input
 	}
+
 	export "metrics_input" {
 		value = otelcol.processor.filter.metrics.input
 	}
+
 	export "traces_input" {
 		value = otelcol.processor.filter.traces.input
 	}
@@ -339,11 +359,13 @@ declare "tenant_route" {
 
 	otelcol.processor.filter "logs" {
 		error_mode = "ignore"
+
 		logs {
 			log_record = [
 				argument.keep_condition.value,
 			]
 		}
+
 		output {
 			logs = [otelcol.exporter.otlphttp.logs.input]
 		}
@@ -366,11 +388,13 @@ declare "tenant_route" {
 	// namespaces (all of them), and their metrics ship under this tenant_id.
 	otelcol.processor.filter "traces" {
 		error_mode = "ignore"
+
 		traces {
 			span = [
 				argument.keep_condition.value,
 			]
 		}
+
 		output {
 			traces = [
 				otelcol.exporter.otlphttp.traces.input,
@@ -382,6 +406,7 @@ declare "tenant_route" {
 
 	otelcol.connector.servicegraph "default" {
 		dimensions = coalesce(argument.servicegraph_dimensions.value, ["http.request.method", "http.route"])
+
 		output {
 			metrics = [otelcol.processor.transform.promote.input]
 		}
@@ -431,9 +456,11 @@ declare "tenant_route" {
 		dimension {
 			name = "http.request.method"
 		}
+
 		dimension {
 			name = "http.route"
 		}
+
 		dimension {
 			name = "http.response.status_code"
 		}
@@ -468,11 +495,13 @@ declare "tenant_route" {
 	// the traces filter upstream).
 	otelcol.processor.filter "metrics" {
 		error_mode = "ignore"
+
 		metrics {
 			metric = [
 				argument.keep_condition.value,
 			]
 		}
+
 		output {
 			metrics = [otelcol.processor.transform.promote.input]
 		}
@@ -501,8 +530,9 @@ declare "tenant_route" {
 	// through here, so every exported series carries the same k8s labels.
 	otelcol.processor.transform "promote" {
 		error_mode = "ignore"
+
 		metric_statements {
-			context = "datapoint"
+			context    = "datapoint"
 			statements = [
 				`set(attributes["namespace"], resource.attributes["k8s.namespace.name"])`,
 				`set(attributes["deployment"], resource.attributes["k8s.deployment.name"])`,
@@ -510,6 +540,7 @@ declare "tenant_route" {
 				`set(attributes["project_name"], resource.attributes["project.name"])`,
 			]
 		}
+
 		output {
 			metrics = [otelcol.exporter.prometheus.metrics.input]
 		}

@@ -100,15 +100,19 @@ declare "metrics" {
 	argument "namespaces" {
 		comment = "The namespaces to discover PrometheusRule CRDs in"
 	}
+
 	argument "tenant_id" {
 		comment = "The tenant (X-Scope-OrgID) the rules are synced under"
 	}
+
 	argument "ruler_endpoint" {
 		comment = "Mimir ruler endpoint for metric alerting/recording rules"
 	}
+
 	argument "endpoint_basic_auth_username" {
 		comment = "Basic-auth username for the ruler endpoint"
 	}
+
 	argument "endpoint_basic_auth_password" {
 		comment = "Basic-auth password for the ruler endpoint"
 	}
@@ -118,6 +122,7 @@ declare "metrics" {
 		comment  = "How often to reconcile CRDs into the ruler (default: \"5m\")"
 		optional = true
 	}
+
 	argument "namespace_prefix" {
 		comment  = "Ruler namespace prefix this cluster OWNS and prunes (default: \"alloy\"). MUST be unique per cluster on a shared tenant -- see the header; the default deletes other clusters' rules. Use the cluster name."
 		optional = true
@@ -174,15 +179,19 @@ declare "logs" {
 	argument "namespaces" {
 		comment = "The namespaces to discover PrometheusRule CRDs in"
 	}
+
 	argument "tenant_id" {
 		comment = "The tenant (X-Scope-OrgID) the rules are synced under"
 	}
+
 	argument "ruler_endpoint" {
 		comment = "Loki ruler endpoint for log alerting/recording rules"
 	}
+
 	argument "endpoint_basic_auth_username" {
 		comment = "Basic-auth username for the ruler endpoint"
 	}
+
 	argument "endpoint_basic_auth_password" {
 		comment = "Basic-auth password for the ruler endpoint"
 	}
@@ -192,6 +201,7 @@ declare "logs" {
 		comment  = "How often to reconcile CRDs into the ruler (default: \"5m\")"
 		optional = true
 	}
+
 	argument "namespace_prefix" {
 		comment  = "Ruler namespace prefix this cluster OWNS and prunes (default: \"alloy\"). MUST be unique per cluster on a shared tenant -- see the header; the default deletes other clusters' rules. Use the cluster name."
 		optional = true
