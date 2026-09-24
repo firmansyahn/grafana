@@ -1,0 +1,1114 @@
+// postgres_metrics
+//
+// Metrics for a PostgreSQL high-availability stack built the usual way:
+// Postgres managed by Patroni, Patroni's leader lock kept in etcd, PgBouncer
+// pooling connections, and HAProxy sending clients to whichever node Patroni
+// has made primary. Everything is remote-written to a Prometheus-compatible
+// backend (e.g. Mimir) under a single tenant.
+//
+// One declare per component, each usable on its own, because the components
+// do not always share a host -- etcd often runs on nodes of its own, HAProxy
+// and PgBouncer sometimes sit on the application side, and a plain Postgres
+// needs no Patroni at all:
+//
+//   postgres   Postgres itself, through the embedded postgres_exporter
+//              (prometheus.exporter.postgres).
+//   patroni    Patroni's REST API, which serves Prometheus metrics natively.
+//   etcd       etcd's own /metrics.
+//   haproxy    HAProxy's built-in Prometheus exporter.
+//   pgbouncer  PgBouncer, through a pgbouncer_exporter -- PgBouncer has no
+//              metrics endpoint and Alloy embeds no exporter for it; see the
+//              declare.
+//
+// Node-local, like host_metrics: each collector scrapes only the components on
+// its own host, over loopback by default, with clustering disabled. Where every
+// database node runs the whole stack, instantiate all five on every node.
+// Loopback targets need the collector in the host's network namespace
+// (--network=host under Docker/Podman), which host_metrics requires already.
+//
+// Shared label shape, so one dashboard variable selects a host across every
+// component:
+//
+//   instance, node  the host, set exactly as host_metrics sets them, so these
+//                   series join onto that host's node_* series.
+//   job             integrations/<component> by default -- integrations/postgres
+//                   is what prometheus.exporter.postgres sets on its own -- and
+//                   overridable per declare with job_name.
+//
+// On top of that each component carries its own identity: Patroni labels every
+// series with scope (the cluster) and name (the member), pgbouncer_exporter
+// with the database and user of each pool, HAProxy with proxy and server.
+//
+// Delivery -- every declare supports both, and they are mutually exclusive, as
+// in host_logs:
+//   - Default: the embedded prometheus.remote_write, configured with tenant_id,
+//     endpoint_url and endpoint_basic_auth_*, exactly like host_metrics.
+//   - forward_to: send to any list(MetricsReceiver) instead; the embedded writer
+//     is then never fed. This is how the declares on one host share ONE
+//     remote_write -- give one of them the endpoint, and point the others'
+//     forward_to at its exported receiver -- and how site-specific relabeling
+//     is injected: your own prometheus.relabel, forwarding on to that receiver.
+//     External labels (region, zone, cluster_name or external_labels) are
+//     applied by whichever remote_write the series finally reach, so set them
+//     on that one declare.
+//
+// Verified end to end on a three-node Patroni 4.1 / PostgreSQL 18 cluster on
+// Docker, with etcd 3.6 (client mTLS), HAProxy 3.3 and PgBouncer 1.25, on a
+// primary and a replica. One node running all five came to 3,700-3,900 series:
+// etcd ~1,500, Postgres ~1,300, HAProxy ~760 for six server lines (it scales
+// with the configuration -- see its declare), PgBouncer 140-350 depending on
+// connected clients, Patroni 28.
+//
+// Usage (a database node running all five, sharing one remote_write):
+//   postgres_metrics.postgres "db" {
+//       tenant_id                    = "my-tenant"
+//       endpoint_url                 = sys.env("MIMIR_ENDPOINT_URL")
+//       endpoint_basic_auth_username = sys.env("AUTH_BASIC_USERNAME")
+//       endpoint_basic_auth_password = sys.env("AUTH_BASIC_PASSWORD")
+//       data_source_names            = [sys.env("POSTGRES_MONITOR_DSN")]
+//       region                       = sys.env("REGION")
+//   }
+//   postgres_metrics.patroni "db" {
+//       forward_to = [postgres_metrics.postgres.db.receiver]
+//   }
+//   postgres_metrics.etcd "db" {
+//       forward_to = [postgres_metrics.postgres.db.receiver]
+//   }
+//   postgres_metrics.haproxy "db" {
+//       forward_to = [postgres_metrics.postgres.db.receiver]
+//   }
+//   postgres_metrics.pgbouncer "db" {
+//       forward_to = [postgres_metrics.postgres.db.receiver]
+//   }
+
+// postgres_metrics.postgres
+//
+// Postgres itself, through the embedded postgres_exporter
+// (prometheus.exporter.postgres).
+//
+// Point the DSN at THIS node's Postgres, on its own port -- not at the HAProxy
+// or PgBouncer in front of it. Through HAProxy every node would report on
+// whichever node is currently primary; through a transaction-mode PgBouncer
+// successive scrapes can land on different server connections. Connected
+// directly, replicas report too, and they report what only a standby has:
+// replication lag, and how long since it last replayed a transaction.
+//
+// Monitoring role: no superuser needed. The built-in pg_monitor role covers
+// everything the default collectors read:
+//     CREATE ROLE alloy_monitor LOGIN PASSWORD '...' IN ROLE pg_monitor;
+// Run it on the primary; replicas get the role by replication. pg_hba.conf has
+// to admit it from wherever the collector connects. Under Patroni that rule
+// belongs in postgresql.pg_hba (patroni.yml or the DCS configuration), which
+// Patroni writes pg_hba.conf from.
+//
+// What the embedded exporter does NOT do, as of Alloy v1.19:
+//   - Table-level collectors (stat_user_tables, statio_user_tables) read only
+//     the database the DSN names; connected to `postgres` they report nothing
+//     about application tables. Database-level ones (database, stat_database,
+//     locks) cover every database regardless.
+//   - Checkpoint counters moved from pg_stat_bgwriter to pg_stat_checkpointer
+//     in PostgreSQL 17, and the collector that reads the new view is off by
+//     default -- on 17+ add "stat_checkpointer" (see enabled_collectors). Left
+//     off here because on 16 and older it logs a warning on every scrape.
+//   - PgBouncer's admin console is not a target: the exporter opens every
+//     scrape with SELECT version(), which the console refuses ("invalid
+//     command"), so it never gets as far as a query. Use the pgbouncer declare.
+//
+// Reading the replication series under Patroni:
+//   - pg_replication_is_replica and pg_replication_lag_seconds come from every
+//     node. Lag is 0 on the primary, and on a standby that has replayed
+//     everything it received.
+//   - pg_stat_replication_* comes from the primary, one set per connected
+//     standby, labelled application_name -- which Patroni sets to the
+//     standby's member name, the same value as its patroni_* name label. Its
+//     slot_name label holds the walsender's PID rather than a slot (the view
+//     has no slot column), so every standby reconnect starts new series: select
+//     on application_name, never slot_name.
+//   - Inactive slots on a replica are normal: Patroni keeps a copy of every
+//     other member's physical slot there, advancing it itself, so a promoted
+//     replica already has them. pg_replication_slot_slot_is_active is 0 for
+//     each by design -- alert on inactive slots only where
+//     pg_replication_is_replica == 0.
+//
+// pg_stat_activity_count and pg_stat_activity_max_tx_duration are labelled with
+// application_name, which clients choose. If yours put pod names or PIDs there
+// it churns; drop the label in a prometheus.relabel reached through forward_to.
+//
+// Requirements:
+//   - The DSN is a libpq URL. A password with URL-special characters must be
+//     encoded: "postgresql://alloy_monitor:" +
+//     encoding.url_encode(sys.env("PG_MONITOR_PASSWORD")) +
+//     "@127.0.0.1:5432/postgres?sslmode=disable".
+//
+// Usage:
+//   postgres_metrics.postgres "db" {
+//       tenant_id                    = "my-tenant"
+//       endpoint_url                 = sys.env("MIMIR_ENDPOINT_URL")
+//       endpoint_basic_auth_username = sys.env("AUTH_BASIC_USERNAME")
+//       endpoint_basic_auth_password = sys.env("AUTH_BASIC_PASSWORD")
+//       data_source_names            = [sys.env("POSTGRES_MONITOR_DSN")]
+//   }
+declare "postgres" {
+	// -- Required -----------------------------------------------------------
+	argument "data_source_names" {
+		comment = "list(secret) of libpq connection URLs -- normally exactly one, this node's own Postgres, e.g. postgresql://alloy_monitor:<password>@127.0.0.1:5432/postgres?sslmode=disable. With several, only the first gets the collector-based metrics (pg_stat_database, pg_locks, pg_replication and the rest); that is the exporter's limitation, not this module's."
+	}
+
+	// -- Delivery: embedded remote_write, or forward_to ---------------------
+	// An explicit [] coalesces to the default -- pass a real receiver, or omit.
+	argument "forward_to" {
+		comment  = "list(MetricsReceiver) to send metrics to INSTEAD of the embedded remote_write: another declare's exported receiver, to share one remote_write, or your own prometheus.relabel (default: unset, use the embedded remote_write)"
+		optional = true
+	}
+	argument "tenant_id" {
+		comment  = "The tenant (X-Scope-OrgID) for the embedded remote_write. Required unless forward_to is set."
+		optional = true
+		default  = ""
+	}
+	argument "endpoint_url" {
+		comment  = "Prometheus-compatible remote_write URL (e.g. Mimir) for the embedded writer. Required unless forward_to is set; the default points at a local Mimir so a misconfiguration fails loudly with connection errors rather than silently discarding metrics."
+		optional = true
+		default  = "http://localhost:9009/api/v1/push"
+	}
+	// Alloy has no conditional blocks, so basic_auth is always present on the
+	// embedded endpoint. Left empty it sends an empty Basic header, which an
+	// endpoint without authentication ignores.
+	argument "endpoint_basic_auth_username" {
+		comment  = "Basic-auth username for the embedded remote_write (default: \"\", no credentials)"
+		optional = true
+		default  = ""
+	}
+	argument "endpoint_basic_auth_password" {
+		comment  = "Basic-auth password for the embedded remote_write (default: \"\", no credentials)"
+		optional = true
+		default  = ""
+	}
+
+	// -- Optional -----------------------------------------------------------
+	argument "node_name" {
+		comment  = "Node name for the instance/node labels (default: sys.env(\"K8S_NODE_NAME\"), else the hostname)"
+		optional = true
+	}
+	argument "enabled_collectors" {
+		comment  = "Collectors to run (default: [], the exporter's default set: database, locks, replication, replication_slot, roles, stat_bgwriter, stat_database, stat_progress_vacuum, stat_user_tables, statio_user_tables, wal). A non-empty list REPLACES that set rather than adding to it, so to add one, list the defaults plus it -- e.g. the defaults plus \"stat_checkpointer\" on PostgreSQL 17+, and \"long_running_transactions\" for the age of the oldest open transaction."
+		optional = true
+		default  = []
+	}
+	argument "disable_settings_metrics" {
+		comment  = "Skip the pg_settings_* series, one per numeric server setting (default: false). They hold max_connections and friends, which utilisation panels divide by."
+		optional = true
+		default  = false
+	}
+	argument "custom_queries_config_path" {
+		comment  = "YAML file of extra queries to expose as metrics, in postgres_exporter's queries.yaml format, as seen from inside the collector (default: \"\", none)"
+		optional = true
+		default  = ""
+	}
+	argument "scrape_interval" {
+		comment  = "How often to collect (default: \"30s\")"
+		optional = true
+		default  = "30s"
+	}
+	// The embedded exporter enforces its own 10s collection timeout per scrape
+	// regardless of this value.
+	argument "scrape_timeout" {
+		comment  = "Scrape timeout (default: \"10s\")"
+		optional = true
+		default  = "10s"
+	}
+	argument "job_name" {
+		comment  = "Value for the job label (default: \"integrations/postgres\", the exporter's own)"
+		optional = true
+		default  = "integrations/postgres"
+	}
+	argument "region" {
+		comment  = "Value for the region external label (default: \"\", unset)"
+		optional = true
+	}
+	argument "zone" {
+		comment  = "Value for the zone external label (default: \"\", unset)"
+		optional = true
+	}
+	argument "cluster_name" {
+		comment  = "Value for the cluster_name external label (default: \"\", unset)"
+		optional = true
+	}
+	// Alloy has no map-merge function, so this REPLACES the default external
+	// label set rather than adding to it -- same contract as host_metrics.
+	argument "external_labels" {
+		comment  = "Complete external_labels map for the embedded remote_write, REPLACING the region/zone/cluster_name defaults (default: unset, which keeps them). Use it to carry site-specific labels such as environment or role."
+		optional = true
+	}
+
+	prometheus.exporter.postgres "default" {
+		data_source_names          = argument.data_source_names.value
+		enabled_collectors         = argument.enabled_collectors.value
+		disable_settings_metrics   = argument.disable_settings_metrics.value
+		custom_queries_config_path = argument.custom_queries_config_path.value
+	}
+
+	discovery.relabel "postgres" {
+		targets = prometheus.exporter.postgres.default.targets
+
+		// The exporter's own instance is the DSN's host:port/database -- the
+		// same "127.0.0.1:5432/postgres" on every node when each connects over
+		// loopback, which would make every node's series collide. The node
+		// name is what tells them apart and what joins them to host_metrics.
+		rule {
+			target_label = "instance"
+			replacement  = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"), constants.hostname)
+		}
+		rule {
+			target_label = "node"
+			replacement  = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"), constants.hostname)
+		}
+
+		// Explicit, as in host_metrics: the exporter's target already carries
+		// job="integrations/postgres", which would win over the scrape's
+		// job_name.
+		rule {
+			target_label = "job"
+			replacement  = argument.job_name.value
+		}
+	}
+
+	prometheus.scrape "postgres" {
+		targets    = discovery.relabel.postgres.output
+		forward_to = coalesce(argument.forward_to.value, [prometheus.remote_write.default.receiver])
+
+		scrape_interval = argument.scrape_interval.value
+		scrape_timeout  = argument.scrape_timeout.value
+
+		// Local database only -- do not distribute across the cluster.
+		clustering {
+			enabled = false
+		}
+	}
+
+	// Exposed so the other declares on this host can forward into this one's
+	// tenant-configured remote_write, as in the usage at the top of the file.
+	export "receiver" {
+		value = prometheus.remote_write.default.receiver
+	}
+
+	prometheus.remote_write "default" {
+		endpoint {
+			url = argument.endpoint_url.value
+
+			basic_auth {
+				username = argument.endpoint_basic_auth_username.value
+				password = argument.endpoint_basic_auth_password.value
+			}
+
+			headers = {
+				"X-Scope-OrgID" = argument.tenant_id.value,
+			}
+		}
+
+		external_labels = coalesce(argument.external_labels.value, {
+			region       = coalesce(argument.region.value, ""),
+			zone         = coalesce(argument.zone.value, ""),
+			cluster_name = coalesce(argument.cluster_name.value, ""),
+		})
+	}
+}
+
+// postgres_metrics.patroni
+//
+// Patroni's own metrics, from GET /metrics on its REST API -- no exporter.
+// Every series is labelled scope (the Patroni cluster) and name (the member).
+//
+// What they answer:
+//   - Who leads: patroni_primary is 1 on exactly one member of a healthy
+//     scope; patroni_replica on the rest. max by (scope) (patroni_primary) == 0
+//     is a cluster with no writable node.
+//   - Can Patroni still reach the DCS: patroni_dcs_last_seen is the epoch of
+//     its last successful contact. A primary that loses the DCS for longer
+//     than retry_timeout (10s by default) demotes itself, unless failsafe_mode
+//     is on.
+//   - Failovers: patroni_postgres_timeline steps up by one on each promotion.
+//   - Maintenance: patroni_is_paused (auto-failover off) and
+//     patroni_pending_restart (a parameter change is waiting for a restart).
+//   - Replication position, in bytes: patroni_xlog_location on the primary,
+//     patroni_xlog_received_location and patroni_xlog_replayed_location on
+//     replicas. Each is 0 on the members it does not apply to.
+//
+// TLS: when patroni.yml sets restapi.certfile the API is HTTPS-only -- set
+// scheme = "https" and ca_file to the CA that signed it. GET /metrics is not
+// covered by restapi.authentication, which guards only the unsafe (state-
+// changing) endpoints, so no credentials are needed. A client certificate is
+// needed only if restapi.verify_client is "required".
+//
+// Usage (HTTPS REST API, collector in a container that mounts the host's / at
+// /host/root, as host_metrics requires):
+//   postgres_metrics.patroni "db" {
+//       scheme     = "https"
+//       ca_file    = "/host/root/etc/patroni/ca.crt"
+//       forward_to = [postgres_metrics.postgres.db.receiver]
+//   }
+declare "patroni" {
+	// -- Delivery: embedded remote_write, or forward_to ---------------------
+	argument "forward_to" {
+		comment  = "list(MetricsReceiver) to send metrics to INSTEAD of the embedded remote_write: another declare's exported receiver, to share one remote_write, or your own prometheus.relabel (default: unset, use the embedded remote_write)"
+		optional = true
+	}
+	argument "tenant_id" {
+		comment  = "The tenant (X-Scope-OrgID) for the embedded remote_write. Required unless forward_to is set."
+		optional = true
+		default  = ""
+	}
+	argument "endpoint_url" {
+		comment  = "Prometheus-compatible remote_write URL (e.g. Mimir) for the embedded writer. Required unless forward_to is set; the default points at a local Mimir so a misconfiguration fails loudly."
+		optional = true
+		default  = "http://localhost:9009/api/v1/push"
+	}
+	argument "endpoint_basic_auth_username" {
+		comment  = "Basic-auth username for the embedded remote_write (default: \"\", no credentials)"
+		optional = true
+		default  = ""
+	}
+	argument "endpoint_basic_auth_password" {
+		comment  = "Basic-auth password for the embedded remote_write (default: \"\", no credentials)"
+		optional = true
+		default  = ""
+	}
+
+	// -- Target -------------------------------------------------------------
+	argument "address" {
+		comment  = "host:port of the Patroni REST API (default: \"127.0.0.1:8008\", restapi.listen's usual port, over loopback)"
+		optional = true
+		default  = "127.0.0.1:8008"
+	}
+	argument "scheme" {
+		comment  = "\"http\" (default) or \"https\" -- https whenever restapi.certfile is set, since Patroni then serves TLS only"
+		optional = true
+		default  = "http"
+	}
+	argument "ca_file" {
+		comment  = "CA bundle to verify the REST API certificate against, as a path inside the collector (default: \"\", the system roots)"
+		optional = true
+		default  = ""
+	}
+	argument "cert_file" {
+		comment  = "Client certificate, only needed when restapi.verify_client is \"required\" (default: \"\", none)"
+		optional = true
+		default  = ""
+	}
+	argument "key_file" {
+		comment  = "Key for cert_file (default: \"\", none)"
+		optional = true
+		default  = ""
+	}
+	argument "server_name" {
+		comment  = "Name to verify the certificate against when address is not among its SANs, e.g. the node's hostname when scraping over 127.0.0.1 (default: \"\", the host in address)"
+		optional = true
+		default  = ""
+	}
+	argument "insecure_skip_verify" {
+		comment  = "Skip certificate verification (default: false)"
+		optional = true
+		default  = false
+	}
+
+	// -- Optional -----------------------------------------------------------
+	argument "node_name" {
+		comment  = "Node name for the instance/node labels (default: sys.env(\"K8S_NODE_NAME\"), else the hostname)"
+		optional = true
+	}
+	argument "scrape_interval" {
+		comment  = "How often to scrape (default: \"30s\")"
+		optional = true
+		default  = "30s"
+	}
+	argument "scrape_timeout" {
+		comment  = "Scrape timeout (default: \"10s\")"
+		optional = true
+		default  = "10s"
+	}
+	argument "job_name" {
+		comment  = "Value for the job label (default: \"integrations/patroni\")"
+		optional = true
+		default  = "integrations/patroni"
+	}
+	argument "region" {
+		comment  = "Value for the region external label (default: \"\", unset)"
+		optional = true
+	}
+	argument "zone" {
+		comment  = "Value for the zone external label (default: \"\", unset)"
+		optional = true
+	}
+	argument "cluster_name" {
+		comment  = "Value for the cluster_name external label (default: \"\", unset)"
+		optional = true
+	}
+	argument "external_labels" {
+		comment  = "Complete external_labels map for the embedded remote_write, REPLACING the region/zone/cluster_name defaults (default: unset, which keeps them)"
+		optional = true
+	}
+
+	prometheus.scrape "patroni" {
+		// instance is the node, not the address: over loopback the address
+		// is the same 127.0.0.1:8008 on every node.
+		targets = [{
+			"__address__" = argument.address.value,
+			"instance"    = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"), constants.hostname),
+			"node"        = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"), constants.hostname),
+		}]
+		forward_to = coalesce(argument.forward_to.value, [prometheus.remote_write.default.receiver])
+
+		job_name        = argument.job_name.value
+		scheme          = argument.scheme.value
+		scrape_interval = argument.scrape_interval.value
+		scrape_timeout  = argument.scrape_timeout.value
+
+		tls_config {
+			ca_file              = argument.ca_file.value
+			cert_file            = argument.cert_file.value
+			key_file             = argument.key_file.value
+			server_name          = argument.server_name.value
+			insecure_skip_verify = argument.insecure_skip_verify.value
+		}
+
+		// Local member only -- do not distribute across the cluster.
+		clustering {
+			enabled = false
+		}
+	}
+
+	export "receiver" {
+		value = prometheus.remote_write.default.receiver
+	}
+
+	prometheus.remote_write "default" {
+		endpoint {
+			url = argument.endpoint_url.value
+
+			basic_auth {
+				username = argument.endpoint_basic_auth_username.value
+				password = argument.endpoint_basic_auth_password.value
+			}
+
+			headers = {
+				"X-Scope-OrgID" = argument.tenant_id.value,
+			}
+		}
+
+		external_labels = coalesce(argument.external_labels.value, {
+			region       = coalesce(argument.region.value, ""),
+			zone         = coalesce(argument.zone.value, ""),
+			cluster_name = coalesce(argument.cluster_name.value, ""),
+		})
+	}
+}
+
+// postgres_metrics.etcd
+//
+// etcd's own /metrics -- here, the etcd that holds Patroni's leader lock.
+//
+// Where to scrape. etcd serves /metrics on every client URL, and also on
+// --listen-metrics-urls when that is set. With --client-cert-auth=true the
+// client port refuses a TLS handshake that presents no client certificate,
+// /metrics included (verified on etcd 3.6: "tlsv13 alert certificate
+// required"). That leaves two options:
+//
+//   1. PREFERRED: a metrics-only listener, --listen-metrics-urls=
+//      http://127.0.0.1:2381. It serves just /metrics and /health, plain HTTP
+//      and unauthenticated -- only counters and histograms, no keys or values.
+//      Bound to loopback it is unreachable from the network, while a collector
+//      in the host network namespace still reaches it. Then:
+//          address = "127.0.0.1:2381"
+//      Adding the flag restarts the member, so roll it one member at a time.
+//
+//   2. A client certificate on the client port (scheme = "https", ca_file,
+//      cert_file, key_file). It works, but know what the certificate grants:
+//      unless etcd authentication has been enabled (`etcdctl auth enable` --
+//      rare for a Patroni DCS), ANY certificate the etcd CA signed is root in
+//      etcd, with read/write on every key, Patroni's leader lock included. A
+//      collector holding one can depose the primary. The same reasoning is set
+//      out for the Kubernetes etcd in host_metrics' control_plane declare.
+//
+// What to watch:
+//   - etcd_server_has_leader == 0 on any member: that member cannot serve
+//     writes, and a Patroni that reaches only such members cannot renew its
+//     lock.
+//   - etcd_mvcc_db_total_size_in_bytes against etcd_server_quota_backend_bytes
+//     (2 GiB by default). Patroni rewrites its member key and the leader's WAL
+//     position on every loop, and etcd keeps every revision until something
+//     compacts them -- which, without --auto-compaction-retention, nothing
+//     does. The database grows until it hits the quota, etcd raises a NOSPACE
+//     alarm and stops accepting writes, and Patroni can no longer update the
+//     leader key.
+//   - etcd_server_leader_changes_seen_total rising, and the fsync and commit
+//     latency histograms (etcd_disk_wal_fsync_duration_seconds,
+//     etcd_disk_backend_commit_duration_seconds): slow disks show up here first.
+//
+// Do not alert on how many members report. Each collector scrapes only its own
+// member, so a member that stops reporting simply stops producing series, which
+// reads exactly like a member loss even when only its collector restarted.
+// Alert on what each member reports about itself.
+//
+// Size: about 1,500 series per member on etcd 3.6, half of them
+// grpc_server_handled_total -- one counter per gRPC method and status code, 43
+// methods by 17 codes, nearly all permanently zero. etcd's own mixin alerts and
+// dashboards read grpc_server_handled_total and grpc_server_started_total, so
+// keep those; nothing in it reads grpc_server_msg_received_total,
+// grpc_server_msg_sent_total or the ~180 etcd_debugging_* series, which are the
+// ones to drop, in a prometheus.relabel reached through forward_to, if the count
+// matters.
+//
+// Usage (metrics listener on loopback, option 1):
+//   postgres_metrics.etcd "db" {
+//       address    = "127.0.0.1:2381"
+//       forward_to = [postgres_metrics.postgres.db.receiver]
+//   }
+declare "etcd" {
+	// -- Delivery: embedded remote_write, or forward_to ---------------------
+	argument "forward_to" {
+		comment  = "list(MetricsReceiver) to send metrics to INSTEAD of the embedded remote_write: another declare's exported receiver, to share one remote_write, or your own prometheus.relabel (default: unset, use the embedded remote_write)"
+		optional = true
+	}
+	argument "tenant_id" {
+		comment  = "The tenant (X-Scope-OrgID) for the embedded remote_write. Required unless forward_to is set."
+		optional = true
+		default  = ""
+	}
+	argument "endpoint_url" {
+		comment  = "Prometheus-compatible remote_write URL (e.g. Mimir) for the embedded writer. Required unless forward_to is set; the default points at a local Mimir so a misconfiguration fails loudly."
+		optional = true
+		default  = "http://localhost:9009/api/v1/push"
+	}
+	argument "endpoint_basic_auth_username" {
+		comment  = "Basic-auth username for the embedded remote_write (default: \"\", no credentials)"
+		optional = true
+		default  = ""
+	}
+	argument "endpoint_basic_auth_password" {
+		comment  = "Basic-auth password for the embedded remote_write (default: \"\", no credentials)"
+		optional = true
+		default  = ""
+	}
+
+	// -- Target -------------------------------------------------------------
+	argument "address" {
+		comment  = "host:port serving etcd's /metrics (default: \"127.0.0.1:2379\", the client port, which serves metrics when it is plain HTTP). Prefer a --listen-metrics-urls listener such as \"127.0.0.1:2381\" -- see the header."
+		optional = true
+		default  = "127.0.0.1:2379"
+	}
+	argument "scheme" {
+		comment  = "\"http\" (default) or \"https\""
+		optional = true
+		default  = "http"
+	}
+	argument "ca_file" {
+		comment  = "CA bundle to verify etcd's certificate against, as a path inside the collector (default: \"\", the system roots)"
+		optional = true
+		default  = ""
+	}
+	argument "cert_file" {
+		comment  = "Client certificate for a client port running --client-cert-auth (default: \"\", none). Read the header before using one."
+		optional = true
+		default  = ""
+	}
+	argument "key_file" {
+		comment  = "Key for cert_file (default: \"\", none)"
+		optional = true
+		default  = ""
+	}
+	argument "server_name" {
+		comment  = "Name to verify the certificate against when address is not among its SANs (default: \"\", the host in address)"
+		optional = true
+		default  = ""
+	}
+	argument "insecure_skip_verify" {
+		comment  = "Skip certificate verification (default: false)"
+		optional = true
+		default  = false
+	}
+
+	// -- Optional -----------------------------------------------------------
+	argument "node_name" {
+		comment  = "Node name for the instance/node labels (default: sys.env(\"K8S_NODE_NAME\"), else the hostname)"
+		optional = true
+	}
+	argument "scrape_interval" {
+		comment  = "How often to scrape (default: \"30s\")"
+		optional = true
+		default  = "30s"
+	}
+	argument "scrape_timeout" {
+		comment  = "Scrape timeout (default: \"10s\")"
+		optional = true
+		default  = "10s"
+	}
+	argument "job_name" {
+		comment  = "Value for the job label (default: \"integrations/etcd\"). etcd's upstream alerting mixin selects job=~\".*etcd.*\", which this matches."
+		optional = true
+		default  = "integrations/etcd"
+	}
+	argument "region" {
+		comment  = "Value for the region external label (default: \"\", unset)"
+		optional = true
+	}
+	argument "zone" {
+		comment  = "Value for the zone external label (default: \"\", unset)"
+		optional = true
+	}
+	argument "cluster_name" {
+		comment  = "Value for the cluster_name external label (default: \"\", unset)"
+		optional = true
+	}
+	argument "external_labels" {
+		comment  = "Complete external_labels map for the embedded remote_write, REPLACING the region/zone/cluster_name defaults (default: unset, which keeps them)"
+		optional = true
+	}
+
+	prometheus.scrape "etcd" {
+		targets = [{
+			"__address__" = argument.address.value,
+			"instance"    = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"), constants.hostname),
+			"node"        = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"), constants.hostname),
+		}]
+		forward_to = coalesce(argument.forward_to.value, [prometheus.remote_write.default.receiver])
+
+		job_name        = argument.job_name.value
+		scheme          = argument.scheme.value
+		scrape_interval = argument.scrape_interval.value
+		scrape_timeout  = argument.scrape_timeout.value
+
+		tls_config {
+			ca_file              = argument.ca_file.value
+			cert_file            = argument.cert_file.value
+			key_file             = argument.key_file.value
+			server_name          = argument.server_name.value
+			insecure_skip_verify = argument.insecure_skip_verify.value
+		}
+
+		// Local member only -- do not distribute across the cluster.
+		clustering {
+			enabled = false
+		}
+	}
+
+	export "receiver" {
+		value = prometheus.remote_write.default.receiver
+	}
+
+	prometheus.remote_write "default" {
+		endpoint {
+			url = argument.endpoint_url.value
+
+			basic_auth {
+				username = argument.endpoint_basic_auth_username.value
+				password = argument.endpoint_basic_auth_password.value
+			}
+
+			headers = {
+				"X-Scope-OrgID" = argument.tenant_id.value,
+			}
+		}
+
+		external_labels = coalesce(argument.external_labels.value, {
+			region       = coalesce(argument.region.value, ""),
+			zone         = coalesce(argument.zone.value, ""),
+			cluster_name = coalesce(argument.cluster_name.value, ""),
+		})
+	}
+}
+
+// postgres_metrics.haproxy
+//
+// HAProxy's built-in Prometheus exporter (promex).
+//
+// It is compiled into the official haproxy images (`haproxy -vv` lists
+// "Available services : prometheus-exporter") but answers nothing until the
+// configuration routes a request to it. A frontend of its own, on loopback:
+//
+//   frontend prometheus
+//       mode http
+//       bind 127.0.0.1:8404
+//       http-request use-service prometheus-exporter if { path /metrics }
+//       no log
+//
+// `mode http` is required even when defaults set mode tcp, as in most Patroni
+// configurations. Loopback rather than the stats listener Patroni's sample
+// configuration binds on every interface: the exporter has no authentication,
+// and it lists every backend server with its state.
+//
+// What to watch, for a Patroni-routing configuration:
+//   - haproxy_backend_active_servers on the read-write backend should be
+//     exactly 1: HAProxy health-checks each node's Patroni REST API (GET
+//     /primary), so 0 means clients have nowhere to write and more than 1
+//     means two nodes both claim to be primary.
+//   - haproxy_server_status{state="UP"} per server -- one series per state,
+//     1 on the current one -- and haproxy_server_check_last_change_seconds:
+//     which node HAProxy routes to, and for how long.
+//   - haproxy_backend_current_queue, and haproxy_frontend_current_sessions
+//     against haproxy_frontend_limit_sessions: clients queueing inside
+//     HAProxy.
+//
+// Size, on HAProxy 3.3: about 75 series per server line, 70 per backend, 30 per
+// frontend and 80 process-wide. A listen section counts as a frontend plus a
+// backend. Most of it is one-hot state enums -- haproxy_server_check_status
+// alone is 16 series per server.
+//
+// Usage:
+//   postgres_metrics.haproxy "db" {
+//       forward_to = [postgres_metrics.postgres.db.receiver]
+//   }
+declare "haproxy" {
+	// -- Delivery: embedded remote_write, or forward_to ---------------------
+	argument "forward_to" {
+		comment  = "list(MetricsReceiver) to send metrics to INSTEAD of the embedded remote_write: another declare's exported receiver, to share one remote_write, or your own prometheus.relabel (default: unset, use the embedded remote_write)"
+		optional = true
+	}
+	argument "tenant_id" {
+		comment  = "The tenant (X-Scope-OrgID) for the embedded remote_write. Required unless forward_to is set."
+		optional = true
+		default  = ""
+	}
+	argument "endpoint_url" {
+		comment  = "Prometheus-compatible remote_write URL (e.g. Mimir) for the embedded writer. Required unless forward_to is set; the default points at a local Mimir so a misconfiguration fails loudly."
+		optional = true
+		default  = "http://localhost:9009/api/v1/push"
+	}
+	argument "endpoint_basic_auth_username" {
+		comment  = "Basic-auth username for the embedded remote_write (default: \"\", no credentials)"
+		optional = true
+		default  = ""
+	}
+	argument "endpoint_basic_auth_password" {
+		comment  = "Basic-auth password for the embedded remote_write (default: \"\", no credentials)"
+		optional = true
+		default  = ""
+	}
+
+	// -- Target -------------------------------------------------------------
+	argument "address" {
+		comment  = "host:port of the frontend that serves the prometheus-exporter service (default: \"127.0.0.1:8404\", as in the header)"
+		optional = true
+		default  = "127.0.0.1:8404"
+	}
+	argument "metrics_path" {
+		comment  = "Path the frontend routes to the exporter (default: \"/metrics\")"
+		optional = true
+		default  = "/metrics"
+	}
+	argument "scheme" {
+		comment  = "\"http\" (default) or \"https\""
+		optional = true
+		default  = "http"
+	}
+	argument "ca_file" {
+		comment  = "CA bundle to verify the frontend's certificate against, as a path inside the collector (default: \"\", the system roots)"
+		optional = true
+		default  = ""
+	}
+	argument "cert_file" {
+		comment  = "Client certificate, if the frontend demands one (default: \"\", none)"
+		optional = true
+		default  = ""
+	}
+	argument "key_file" {
+		comment  = "Key for cert_file (default: \"\", none)"
+		optional = true
+		default  = ""
+	}
+	argument "server_name" {
+		comment  = "Name to verify the certificate against when address is not among its SANs (default: \"\", the host in address)"
+		optional = true
+		default  = ""
+	}
+	argument "insecure_skip_verify" {
+		comment  = "Skip certificate verification (default: false)"
+		optional = true
+		default  = false
+	}
+
+	// -- Optional -----------------------------------------------------------
+	argument "node_name" {
+		comment  = "Node name for the instance/node labels (default: sys.env(\"K8S_NODE_NAME\"), else the hostname)"
+		optional = true
+	}
+	argument "scrape_interval" {
+		comment  = "How often to scrape (default: \"30s\")"
+		optional = true
+		default  = "30s"
+	}
+	argument "scrape_timeout" {
+		comment  = "Scrape timeout (default: \"10s\")"
+		optional = true
+		default  = "10s"
+	}
+	argument "job_name" {
+		comment  = "Value for the job label (default: \"integrations/haproxy\")"
+		optional = true
+		default  = "integrations/haproxy"
+	}
+	argument "region" {
+		comment  = "Value for the region external label (default: \"\", unset)"
+		optional = true
+	}
+	argument "zone" {
+		comment  = "Value for the zone external label (default: \"\", unset)"
+		optional = true
+	}
+	argument "cluster_name" {
+		comment  = "Value for the cluster_name external label (default: \"\", unset)"
+		optional = true
+	}
+	argument "external_labels" {
+		comment  = "Complete external_labels map for the embedded remote_write, REPLACING the region/zone/cluster_name defaults (default: unset, which keeps them)"
+		optional = true
+	}
+
+	prometheus.scrape "haproxy" {
+		targets = [{
+			"__address__" = argument.address.value,
+			"instance"    = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"), constants.hostname),
+			"node"        = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"), constants.hostname),
+		}]
+		forward_to = coalesce(argument.forward_to.value, [prometheus.remote_write.default.receiver])
+
+		job_name        = argument.job_name.value
+		metrics_path    = argument.metrics_path.value
+		scheme          = argument.scheme.value
+		scrape_interval = argument.scrape_interval.value
+		scrape_timeout  = argument.scrape_timeout.value
+
+		tls_config {
+			ca_file              = argument.ca_file.value
+			cert_file            = argument.cert_file.value
+			key_file             = argument.key_file.value
+			server_name          = argument.server_name.value
+			insecure_skip_verify = argument.insecure_skip_verify.value
+		}
+
+		// Local HAProxy only -- do not distribute across the cluster.
+		clustering {
+			enabled = false
+		}
+	}
+
+	export "receiver" {
+		value = prometheus.remote_write.default.receiver
+	}
+
+	prometheus.remote_write "default" {
+		endpoint {
+			url = argument.endpoint_url.value
+
+			basic_auth {
+				username = argument.endpoint_basic_auth_username.value
+				password = argument.endpoint_basic_auth_password.value
+			}
+
+			headers = {
+				"X-Scope-OrgID" = argument.tenant_id.value,
+			}
+		}
+
+		external_labels = coalesce(argument.external_labels.value, {
+			region       = coalesce(argument.region.value, ""),
+			zone         = coalesce(argument.zone.value, ""),
+			cluster_name = coalesce(argument.cluster_name.value, ""),
+		})
+	}
+}
+
+// postgres_metrics.pgbouncer
+//
+// PgBouncer, through prometheus-community's pgbouncer_exporter.
+//
+// Why an exporter at all: PgBouncer has no metrics endpoint -- 1.25 still
+// publishes its statistics only as SHOW commands on the admin console -- and
+// Alloy embeds no exporter for it. prometheus.exporter.postgres cannot stand in:
+// it opens every scrape with SELECT version(), which the console refuses. So
+// run pgbouncer_exporter next to PgBouncer, on loopback, and this declare
+// scrapes it. For example, as a Compose service beside PgBouncer:
+//
+//   pgbouncer-exporter:
+//     image: quay.io/prometheuscommunity/pgbouncer-exporter:v0.12.1
+//     network_mode: host
+//     command: ["--web.listen-address=127.0.0.1:9127"]
+//     environment:
+//       PGBOUNCER_EXPORTER_CONNECTION_STRING: "postgres://pgbouncer_exporter:<password>@127.0.0.1:6432/pgbouncer?sslmode=disable"
+//
+// PgBouncer side, in pgbouncer.ini:
+//   - The exporter's user in stats_users -- read-only SHOW access -- and NOT in
+//     admin_users, which can also PAUSE, KILL and SHUTDOWN.
+//   - That user able to log in to the virtual `pgbouncer` database; an
+//     auth_file (userlist.txt) entry is the straightforward way.
+//   - ignore_startup_parameters including extra_float_digits, which the
+//     exporter's driver sends on connect; without it every login fails.
+//
+// Series, labelled with each pool's database and user:
+//   - pgbouncer_up: whether the exporter reached PgBouncer. `up` covers only
+//     the exporter itself, so alert on both.
+//   - pgbouncer_pools_client_waiting_connections and
+//     pgbouncer_pools_client_maxwait_seconds: clients queued for a server
+//     connection, and for how long -- the pool-exhaustion signal.
+//   - pgbouncer_pools_server_active_connections / _idle_connections, against
+//     pgbouncer_databases_pool_size.
+//   - pgbouncer_stats_*_total: queries, transactions and bytes per database.
+//   - pgbouncer_client_connections (exporter 0.12+, from SHOW CLIENTS) is also
+//     labelled with each client's application_name -- the same caveat as for
+//     pg_stat_activity in the postgres declare.
+//
+// Usage:
+//   postgres_metrics.pgbouncer "db" {
+//       forward_to = [postgres_metrics.postgres.db.receiver]
+//   }
+declare "pgbouncer" {
+	// -- Delivery: embedded remote_write, or forward_to ---------------------
+	argument "forward_to" {
+		comment  = "list(MetricsReceiver) to send metrics to INSTEAD of the embedded remote_write: another declare's exported receiver, to share one remote_write, or your own prometheus.relabel (default: unset, use the embedded remote_write)"
+		optional = true
+	}
+	argument "tenant_id" {
+		comment  = "The tenant (X-Scope-OrgID) for the embedded remote_write. Required unless forward_to is set."
+		optional = true
+		default  = ""
+	}
+	argument "endpoint_url" {
+		comment  = "Prometheus-compatible remote_write URL (e.g. Mimir) for the embedded writer. Required unless forward_to is set; the default points at a local Mimir so a misconfiguration fails loudly."
+		optional = true
+		default  = "http://localhost:9009/api/v1/push"
+	}
+	argument "endpoint_basic_auth_username" {
+		comment  = "Basic-auth username for the embedded remote_write (default: \"\", no credentials)"
+		optional = true
+		default  = ""
+	}
+	argument "endpoint_basic_auth_password" {
+		comment  = "Basic-auth password for the embedded remote_write (default: \"\", no credentials)"
+		optional = true
+		default  = ""
+	}
+
+	// -- Target -------------------------------------------------------------
+	argument "address" {
+		comment  = "host:port of pgbouncer_exporter (default: \"127.0.0.1:9127\", its default port, over loopback)"
+		optional = true
+		default  = "127.0.0.1:9127"
+	}
+	argument "scheme" {
+		comment  = "\"http\" (default) or \"https\", for an exporter started with a --web.config.file that enables TLS"
+		optional = true
+		default  = "http"
+	}
+	argument "ca_file" {
+		comment  = "CA bundle to verify the exporter's certificate against, as a path inside the collector (default: \"\", the system roots)"
+		optional = true
+		default  = ""
+	}
+	argument "cert_file" {
+		comment  = "Client certificate, if the exporter demands one (default: \"\", none)"
+		optional = true
+		default  = ""
+	}
+	argument "key_file" {
+		comment  = "Key for cert_file (default: \"\", none)"
+		optional = true
+		default  = ""
+	}
+	argument "server_name" {
+		comment  = "Name to verify the certificate against when address is not among its SANs (default: \"\", the host in address)"
+		optional = true
+		default  = ""
+	}
+	argument "insecure_skip_verify" {
+		comment  = "Skip certificate verification (default: false)"
+		optional = true
+		default  = false
+	}
+
+	// -- Optional -----------------------------------------------------------
+	argument "node_name" {
+		comment  = "Node name for the instance/node labels (default: sys.env(\"K8S_NODE_NAME\"), else the hostname)"
+		optional = true
+	}
+	argument "scrape_interval" {
+		comment  = "How often to scrape (default: \"30s\")"
+		optional = true
+		default  = "30s"
+	}
+	argument "scrape_timeout" {
+		comment  = "Scrape timeout (default: \"10s\")"
+		optional = true
+		default  = "10s"
+	}
+	argument "job_name" {
+		comment  = "Value for the job label (default: \"integrations/pgbouncer\")"
+		optional = true
+		default  = "integrations/pgbouncer"
+	}
+	argument "region" {
+		comment  = "Value for the region external label (default: \"\", unset)"
+		optional = true
+	}
+	argument "zone" {
+		comment  = "Value for the zone external label (default: \"\", unset)"
+		optional = true
+	}
+	argument "cluster_name" {
+		comment  = "Value for the cluster_name external label (default: \"\", unset)"
+		optional = true
+	}
+	argument "external_labels" {
+		comment  = "Complete external_labels map for the embedded remote_write, REPLACING the region/zone/cluster_name defaults (default: unset, which keeps them)"
+		optional = true
+	}
+
+	prometheus.scrape "pgbouncer" {
+		targets = [{
+			"__address__" = argument.address.value,
+			"instance"    = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"), constants.hostname),
+			"node"        = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"), constants.hostname),
+		}]
+		forward_to = coalesce(argument.forward_to.value, [prometheus.remote_write.default.receiver])
+
+		job_name        = argument.job_name.value
+		scheme          = argument.scheme.value
+		scrape_interval = argument.scrape_interval.value
+		scrape_timeout  = argument.scrape_timeout.value
+
+		tls_config {
+			ca_file              = argument.ca_file.value
+			cert_file            = argument.cert_file.value
+			key_file             = argument.key_file.value
+			server_name          = argument.server_name.value
+			insecure_skip_verify = argument.insecure_skip_verify.value
+		}
+
+		// Local PgBouncer only -- do not distribute across the cluster.
+		clustering {
+			enabled = false
+		}
+	}
+
+	export "receiver" {
+		value = prometheus.remote_write.default.receiver
+	}
+
+	prometheus.remote_write "default" {
+		endpoint {
+			url = argument.endpoint_url.value
+
+			basic_auth {
+				username = argument.endpoint_basic_auth_username.value
+				password = argument.endpoint_basic_auth_password.value
+			}
+
+			headers = {
+				"X-Scope-OrgID" = argument.tenant_id.value,
+			}
+		}
+
+		external_labels = coalesce(argument.external_labels.value, {
+			region       = coalesce(argument.region.value, ""),
+			zone         = coalesce(argument.zone.value, ""),
+			cluster_name = coalesce(argument.cluster_name.value, ""),
+		})
+	}
+}

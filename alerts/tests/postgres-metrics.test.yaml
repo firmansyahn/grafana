@@ -1,0 +1,786 @@
+# Unit tests for postgres-metrics.yaml. Run them with alerts/test.sh: promtool
+# reads plain rule files, not PrometheusRules, so the script writes the groups
+# out as postgres-metrics.rules.yaml beside a copy of this file.
+#
+# Every rule has a firing case. The cases a rule must NOT fire on are commented
+# where they appear.
+rule_files:
+  - postgres-metrics.rules.yaml
+evaluation_interval: 1m
+tests:
+  - name: target down, and a target that vanished vs one whose job was renamed
+    interval: 1m
+    input_series:
+      - series: up{job="integrations/patroni", instance="n1"}
+        values: 1x10 0x150
+      - series: up{job="integrations/etcd", instance="n2"}
+        values: 1x119
+      # n3's job is renamed at 120m. Same component, same instance: not missing.
+      - series: up{job="patroni", instance="n3"}
+        values: 1x119
+      - series: up{job="integrations/patroni", instance="n3"}
+        values: _x120 1x40
+      # Not a Postgres HA job, so its disappearance is not reported.
+      - series: up{job="integrations/unix", instance="n2"}
+        values: 1x119
+    alert_rule_test:
+      - eval_time: 14m
+        alertname: PostgresHATargetDown
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: PostgresHATargetDown
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: integrations/patroni
+              instance: n1
+            exp_annotations:
+              description: 'Alloy has failed to scrape integrations/patroni on n1 for 5 minutes: the component is down or hung, or it rejects the scrape (TLS, authentication). A Patroni whose REST API hangs also fails HAProxy''s health checks, which takes the node out of every backend while Postgres itself keeps running.'
+              summary: integrations/patroni on n1 is failing its scrapes
+      - eval_time: 122m
+        alertname: PostgresHATargetMissing
+        exp_alerts: []
+      - eval_time: 132m
+        alertname: PostgresHATargetMissing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: etcd
+              job: integrations/etcd
+              instance: n2
+            exp_annotations:
+              description: Nothing from integrations/etcd on n2 for 10 minutes, although it reported within the last 7 days. The node is down, or the Alloy that scrapes it is. A target removed or renamed on purpose keeps this firing for up to 7 days; silence it.
+              summary: integrations/etcd on n2 has stopped reporting
+  - name: no leader, split brain, duplicate scrape, distinct clusters
+    interval: 1m
+    input_series:
+      - series: patroni_cluster_unlocked{scope="a", name="a1", instance="a1"}
+        values: 0x5 1x10
+      - series: patroni_primary{scope="b", name="b1", instance="b1", job="integrations/patroni"}
+        values: 1x10
+      - series: patroni_primary{scope="b", name="b2", instance="b2", job="integrations/patroni"}
+        values: 1x10
+      # c1 is scraped under two jobs: one member, not two primaries.
+      - series: patroni_primary{scope="c", name="c1", instance="c1", job="patroni"}
+        values: 1x10
+      - series: patroni_primary{scope="c", name="c1", instance="c1", job="integrations/patroni"}
+        values: 1x10
+      # Two clusters share scope d, and cluster_name tells them apart.
+      - series: patroni_primary{scope="d", cluster_name="x", name="x1", instance="x1"}
+        values: 1x10
+      - series: patroni_primary{scope="d", cluster_name="y", name="y1", instance="y1"}
+        values: 1x10
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: PatroniClusterHasNoLeader
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              scope: a
+              name: a1
+              instance: a1
+            exp_annotations:
+              description: 'a1 sees no leader lock in the DCS, so no member may run as primary: writes fail until a leader is elected. If this lasts, check that the DCS is healthy and why no replica takes over (lag above maximum_lag_on_failover, nofailover tags, a paused cluster).'
+              summary: Patroni cluster a has no leader
+      - eval_time: 5m
+        alertname: PatroniClusterHasMultiplePrimaries
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              scope: b
+            exp_annotations:
+              description: '2 members of b have reported themselves primary for over a minute: a split brain. Check patronictl list from each member. Two clusters in one tenant that share the scope "b" and have no cluster_name label look the same.'
+              summary: Patroni cluster b has 2 primaries
+  - name: member states
+    interval: 1m
+    input_series:
+      - series: patroni_postgres_running{scope="s", name="p", instance="p"}
+        values: 1 0x10
+      - series: patroni_replica{scope="s", name="p", instance="p"}
+        values: '0x10'
+      - series: patroni_postgres_streaming{scope="s", name="p", instance="p"}
+        values: '0x10'
+      - series: patroni_postgres_running{scope="s", name="r1", instance="r1"}
+        values: 1x10
+      - series: patroni_replica{scope="s", name="r1", instance="r1"}
+        values: 1x10
+      - series: patroni_postgres_streaming{scope="s", name="r1", instance="r1"}
+        values: 1 0x10
+      # r2 is down. PatroniPostgresNotRunning reports that, so
+      # PatroniReplicaNotStreaming does not report it again.
+      - series: patroni_postgres_running{scope="s", name="r2", instance="r2"}
+        values: 1 0x10
+      - series: patroni_replica{scope="s", name="r2", instance="r2"}
+        values: 1x10
+      - series: patroni_postgres_streaming{scope="s", name="r2", instance="r2"}
+        values: 1 0x10
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: PatroniPostgresNotRunning
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              scope: s
+              name: p
+              instance: p
+            exp_annotations:
+              description: 'Patroni on p (s) has reported Postgres down for 2 minutes: starting, stopped, crashed or being rebuilt. patronictl list shows the member''s state and the Patroni log shows why. If this member was the primary, clients are failing and HAProxyBackendDown fires for the primary''s backend.'
+              summary: Postgres is not running on p
+          - exp_labels:
+              severity: warning
+              scope: s
+              name: r2
+              instance: r2
+            exp_annotations:
+              description: 'Patroni on r2 (s) has reported Postgres down for 2 minutes: starting, stopped, crashed or being rebuilt. patronictl list shows the member''s state and the Patroni log shows why. If this member was the primary, clients are failing and HAProxyBackendDown fires for the primary''s backend.'
+              summary: Postgres is not running on r2
+      - eval_time: 8m
+        alertname: PatroniReplicaNotStreaming
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              scope: s
+              name: r1
+              instance: r1
+            exp_annotations:
+              description: r1 (s) runs as a replica but has had no WAL stream from the primary for 5 minutes, so it is falling behind. It is replaying from the archive or cannot connect; its Postgres log shows why (pg_hba.conf, replication credentials, network, a dropped slot).
+              summary: Replica r1 is not streaming WAL
+  - name: no streaming replica
+    interval: 1m
+    input_series:
+      - series: patroni_primary{scope="s", name="p", instance="p"}
+        values: 1x20
+      - series: patroni_primary{scope="s", name="r", instance="r"}
+        values: '0x20'
+      - series: patroni_postgres_streaming{scope="s", name="p", instance="p"}
+        values: '0x20'
+      - series: patroni_postgres_streaming{scope="s", name="r", instance="r"}
+        values: 1x5 0x15
+      # Cluster t still has a streaming replica.
+      - series: patroni_primary{scope="t", name="p", instance="tp"}
+        values: 1x20
+      - series: patroni_postgres_streaming{scope="t", name="r", instance="tr"}
+        values: 1x20
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: PatroniClusterHasNoStreamingReplica
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: PatroniClusterHasNoStreamingReplica
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              scope: s
+            exp_annotations:
+              description: No member of s has streamed from the primary for 5 minutes, so there is no failover target. If the primary fails now the cluster goes down, and its latest writes exist on that node only. A cluster with a single member fires this all the time.
+              summary: Patroni cluster s has no streaming replica
+  - name: DCS age uses the scrape timestamp
+    interval: 1m
+    input_series:
+      # The epoch of Patroni's last DCS contact. It stops advancing at 10m.
+      - series: patroni_dcs_last_seen{scope="s", name="n", instance="n"}
+        values: 0+60x10 600x20
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: PatroniDCSUnreachable
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: PatroniDCSUnreachable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              scope: s
+              name: n
+              instance: n
+            exp_annotations:
+              description: At its last scrape, Patroni on n (s) had not reached the DCS for 5m 0s. A primary that cannot renew its leader key demotes itself once ttl expires, unless failsafe_mode keeps it up; a replica that cannot reach the DCS cannot take over.
+              summary: Patroni on n cannot reach the DCS
+  - name: promotion vs restart
+    interval: 1m
+    input_series:
+      - series: patroni_postgres_timeline{scope="s", name="a", instance="a"}
+        values: 5x69 6x40
+      - series: patroni_primary{scope="s", name="a", instance="a"}
+        values: 0x69 1x40
+      # b reports timeline 0 while Postgres restarts. Returning to timeline 5
+      # afterwards is not a promotion.
+      - series: patroni_postgres_timeline{scope="s", name="b", instance="b"}
+        values: 5x60 0x5 5x44
+      - series: patroni_primary{scope="s", name="b", instance="b"}
+        values: 1x109
+    alert_rule_test:
+      - eval_time: 75m
+        alertname: PatroniPrimaryPromoted
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              scope: s
+              name: a
+              instance: a
+            exp_annotations:
+              description: 'a moved to timeline 6 within the last 10 minutes: a failover or a switchover. A planned switchover needs no action; for an unplanned one, find the cause in the previous primary''s Patroni and Postgres logs.'
+              summary: a is the new primary of s
+      - eval_time: 90m
+        alertname: PatroniPrimaryPromoted
+        exp_alerts: []
+  - name: etcd peers
+    interval: 1m
+    input_series:
+      - series: etcd_network_active_peers{job="integrations/etcd", instance="e1", Local="1", Remote="2"}
+        values: '0x10'
+      - series: etcd_network_known_peers{job="integrations/etcd", instance="e1", Local="1", Remote="2"}
+        values: 1x10
+      # Member 3 was removed from the cluster (known_peers 0), so losing it is
+      # expected.
+      - series: etcd_network_active_peers{job="integrations/etcd", instance="e1", Local="1", Remote="3"}
+        values: '0x10'
+      - series: etcd_network_known_peers{job="integrations/etcd", instance="e1", Local="1", Remote="3"}
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: EtcdMemberUnreachable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: integrations/etcd
+              instance: e1
+              Local: '1'
+              Remote: '2'
+            exp_annotations:
+              description: Member 1 on e1 has had no connection to member 2 for 5 minutes; etcdctl member list maps the IDs to hosts. A three-member cluster that loses one more member loses quorum.
+              summary: etcd on e1 has lost member 2
+  - name: etcd commit latency
+    interval: 1m
+    input_series:
+      - series: etcd_disk_backend_commit_duration_seconds_bucket{job="integrations/etcd", instance="e1", le="0.256"}
+        values: '0x30'
+      - series: etcd_disk_backend_commit_duration_seconds_bucket{job="integrations/etcd", instance="e1", le="0.512"}
+        values: '0x30'
+      - series: etcd_disk_backend_commit_duration_seconds_bucket{job="integrations/etcd", instance="e1", le="1.024"}
+        values: 0+10x30
+      - series: etcd_disk_backend_commit_duration_seconds_bucket{job="integrations/etcd", instance="e1", le="+Inf"}
+        values: 0+10x30
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: EtcdHighCommitDurations
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: integrations/etcd
+              instance: e1
+            exp_annotations:
+              description: The 99th percentile backend commit on e1 has been over 250ms for 10 minutes and is now 1.019s; etcd wants under 25ms. The disk under etcd's data directory is too slow for it, often because it is shared with a busy Postgres.
+              summary: etcd on e1 has slow backend commits
+  - name: haproxy
+    interval: 1m
+    input_series:
+      - series: haproxy_backend_status{instance="h1", proxy="pg-primary", state="DOWN"}
+        values: 0x3 1x10
+      - series: haproxy_backend_status{instance="h1", proxy="pg-primary", state="UP"}
+        values: 1x3 0x10
+      - series: haproxy_server_connection_errors_total{instance="h1", proxy="pg-primary", server="s1"}
+        values: 0+3x20
+      # s2 had one burst of failures that stopped, not a lasting fault.
+      - series: haproxy_server_connection_errors_total{instance="h1", proxy="pg-primary", server="s2"}
+        values: 0x5 40x15
+      - series: haproxy_frontend_current_sessions{instance="h1", proxy="a"}
+        values: 90x10
+      - series: haproxy_frontend_limit_sessions{instance="h1", proxy="a"}
+        values: 100x10
+      # Frontend b has no maxconn (limit 0), so there is no limit to approach.
+      - series: haproxy_frontend_current_sessions{instance="h1", proxy="b"}
+        values: 90x10
+      - series: haproxy_frontend_limit_sessions{instance="h1", proxy="b"}
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: HAProxyBackendDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              instance: h1
+              proxy: pg-primary
+              state: DOWN
+            exp_annotations:
+              description: 'Every server in pg-primary has failed its health check for a minute, so HAProxy on h1 refuses connections to it. For a Patroni primary backend, no member answers /primary: there is no writable primary behind this HAProxy.'
+              summary: HAProxy on h1 has no server left in pg-primary
+      - eval_time: 15m
+        alertname: HAProxyServerConnectionErrors
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              instance: h1
+              proxy: pg-primary
+              server: s1
+            exp_annotations:
+              description: Connections from HAProxy on h1 to s1 in pg-primary have kept failing for 5 minutes, although the server passes its health check. In the usual Patroni layout the check asks Patroni while clients go to PgBouncer or Postgres, so a stopped PgBouncer on a healthy node looks exactly like this.
+              summary: HAProxy on h1 cannot connect to s1 in pg-primary
+      - eval_time: 8m
+        alertname: HAProxyFrontendSessionsNearLimit
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: h1
+              proxy: a
+            exp_annotations:
+              description: 'At its maxconn a frontend stops accepting connections: new clients wait in the kernel''s accept queue or are refused.'
+              summary: HAProxy frontend a on h1 is at 90% of its maxconn
+  - name: postgres connectivity and connections
+    interval: 1m
+    input_series:
+      - series: pg_up{job="integrations/postgres", instance="n1"}
+        values: '0x10'
+      - series: patroni_postgres_running{job="integrations/patroni", instance="n1", scope="s", name="n1"}
+        values: 1x10
+      # Patroni reports n2's Postgres stopped, which PatroniPostgresNotRunning
+      # covers.
+      - series: pg_up{job="integrations/postgres", instance="n2"}
+        values: '0x10'
+      - series: patroni_postgres_running{job="integrations/patroni", instance="n2", scope="s", name="n2"}
+        values: '0x10'
+      # n3 runs no Patroni.
+      - series: pg_up{job="integrations/postgres", instance="n3"}
+        values: '0x10'
+      # n4 has 170 of 200 connections, summed across databases, users and
+      # states.
+      - series: pg_stat_activity_count{job="integrations/postgres", instance="n4", environment="prod", server="127.0.0.1:5432", datname="a", state="active", usename="u", application_name="", backend_type="client backend", wait_event="", wait_event_type=""}
+        values: 100x10
+      - series: pg_stat_activity_count{job="integrations/postgres", instance="n4", environment="prod", server="127.0.0.1:5432", datname="b", state="idle", usename="u", application_name="app", backend_type="client backend", wait_event="ClientRead", wait_event_type="Client"}
+        values: 70x10
+      - series: pg_settings_max_connections{job="integrations/postgres", instance="n4", environment="prod", server="127.0.0.1:5432"}
+        values: 200x10
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: PostgresNotAcceptingConnections
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: integrations/postgres
+              instance: n1
+            exp_annotations:
+              description: The exporter on n1 has not been able to connect for 2 minutes, although Patroni does not report Postgres stopped. Every connection slot is taken (max_connections), Postgres is hung, or the monitoring role can no longer log in (password, pg_hba.conf, its CONNECTION LIMIT). The Alloy log has the exporter's error.
+              summary: Postgres on n1 is refusing connections
+          - exp_labels:
+              severity: critical
+              job: integrations/postgres
+              instance: n3
+            exp_annotations:
+              description: The exporter on n3 has not been able to connect for 2 minutes, although Patroni does not report Postgres stopped. Every connection slot is taken (max_connections), Postgres is hung, or the monitoring role can no longer log in (password, pg_hba.conf, its CONNECTION LIMIT). The Alloy log has the exporter's error.
+              summary: Postgres on n3 is refusing connections
+      - eval_time: 8m
+        alertname: PostgresConnectionsNearLimit
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: integrations/postgres
+              instance: n4
+              environment: prod
+            exp_annotations:
+              description: At max_connections Postgres refuses new connections from everyone but superusers. Find the client holding the most connections in pg_stat_activity, or the pooler in front of it.
+              summary: Postgres on n4 is using 85% of max_connections
+  - name: postgres WAL, transactions, wraparound, exporter
+    interval: 1m
+    input_series:
+      - series: pg_replication_slots_pg_wal_lsn_diff{job="integrations/postgres", instance="n1", server="x", slot_name="n2"}
+        values: 5e9x20
+      - series: pg_replication_slots_pg_wal_lsn_diff{job="integrations/postgres", instance="n1", server="x", slot_name="n3"}
+        values: 1e6x20
+      - series: pg_settings_max_wal_size_bytes{job="integrations/postgres", instance="n1", server="x"}
+        values: 4294967296x20
+      - series: pg_stat_activity_max_tx_duration{job="integrations/postgres", instance="n1", server="x", datname="d", usename="u", application_name="batch", state="active", backend_type="client backend", wait_event="", wait_event_type=""}
+        values: 4000x20
+      # Autovacuum workers run long by design.
+      - series: pg_stat_activity_max_tx_duration{job="integrations/postgres", instance="n1", server="x", datname="d", usename="postgres", application_name="", state="active", backend_type="autovacuum worker", wait_event="", wait_event_type=""}
+        values: 9000x20
+      - series: pg_stat_activity_max_tx_duration{job="integrations/postgres", instance="n1", server="x", datname="d", usename="u", application_name="web", state="idle in transaction", backend_type="client backend", wait_event="ClientRead", wait_event_type="Client"}
+        values: 1000x20
+      - series: pg_database_wraparound_age_datfrozenxid_seconds{job="integrations/postgres", instance="n1", datname="d"}
+        values: 1.2e9x20
+      - series: pg_database_wraparound_age_datminmxid_seconds{job="integrations/postgres", instance="n1", datname="d"}
+        values: 5e8x20
+      - series: pg_scrape_collector_success{job="integrations/postgres", instance="n1", collector="wal"}
+        values: '0x20'
+      - series: pg_exporter_last_scrape_error{job="integrations/postgres", instance="n1"}
+        values: 1x20
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: PostgresReplicationSlotRetainingWAL
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: integrations/postgres
+              instance: n1
+              server: x
+              slot_name: n2
+            exp_annotations:
+              description: Slot n2 on n1 keeps more WAL than max_wal_size because its consumer is disconnected or behind. Postgres keeps that WAL until the consumer catches up, so it grows until the disk is full unless max_slot_wal_keep_size caps it. On a Patroni replica the slot is its copy of another member's slot, which Patroni normally keeps advancing.
+              summary: Replication slot n2 on n1 holds 4.657GiB of WAL
+      - eval_time: 8m
+        alertname: PostgresLongRunningTransaction
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: integrations/postgres
+              instance: n1
+              datname: d
+              usename: u
+              application_name: batch
+              state: active
+            exp_annotations:
+              description: u (batch) has had a transaction open in d for over an hour. It holds back vacuum across the database and can hold locks that others wait for. A pg_dump backup holds one transaction open for its whole run.
+              summary: A transaction on n1 has been running for 1h 6m 40s
+      - eval_time: 8m
+        alertname: PostgresIdleInTransaction
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: integrations/postgres
+              instance: n1
+              datname: d
+              usename: u
+              application_name: web
+              state: idle in transaction
+            exp_annotations:
+              description: 'u (web) opened a transaction in d over 15 minutes ago and now sits idle inside it: the client stopped sending statements without ending the transaction. It keeps its locks and holds back vacuum. idle_in_transaction_session_timeout ends such sessions.'
+              summary: An idle transaction on n1 has been open for 16m 40s
+      - eval_time: 16m
+        alertname: PostgresXIDWraparoundRisk
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: integrations/postgres
+              instance: n1
+              datname: d
+            exp_annotations:
+              description: 'A transaction or multixact ID in d on n1 has gone 1.2G IDs without being frozen. Postgres stops accepting writes as that age nears 2^31 (about 2.1G) to prevent wraparound; anti-wraparound autovacuum normally holds it near autovacuum_freeze_max_age (200M by default). Find what blocks freezing: a long transaction, an abandoned replication slot or prepared transaction, or a table whose autovacuum never finishes.'
+              summary: The oldest unfrozen ID in d on n1 is 1.2G old
+      - eval_time: 16m
+        alertname: PostgresExporterErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: integrations/postgres
+              instance: n1
+              collector: wal
+            exp_annotations:
+              description: 'For 15 minutes the exporter on n1 has failed its wal collector, so the metrics it produces, and the alerts built on them, are missing. The Alloy log has the error: usually a privilege the monitoring role lacks, or a collector the Postgres version does not support.'
+              summary: The Postgres exporter on n1 is failing its wal collector
+          - exp_labels:
+              severity: warning
+              job: integrations/postgres
+              instance: n1
+            exp_annotations:
+              description: 'For 15 minutes the exporter on n1 has failed its built-in queries, so the metrics it produces, and the alerts built on them, are missing. The Alloy log has the error: usually a privilege the monitoring role lacks, or a collector the Postgres version does not support.'
+              summary: The Postgres exporter on n1 is failing its built-in queries
+  - name: pgbouncer
+    interval: 1m
+    input_series:
+      - series: pgbouncer_up{job="integrations/pgbouncer", instance="n1"}
+        values: '0x10'
+      - series: pgbouncer_pools_client_maxwait_seconds{job="integrations/pgbouncer", instance="n1", database="d", user="u"}
+        values: 7x10
+      - series: pgbouncer_used_clients{job="integrations/pgbouncer", instance="n1"}
+        values: 900x10
+      - series: pgbouncer_config_max_client_connections{job="integrations/pgbouncer", instance="n1"}
+        values: 1000x10
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: PgBouncerDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: integrations/pgbouncer
+              instance: n1
+            exp_annotations:
+              description: 'pgbouncer_exporter on n1 has been unable to query PgBouncer''s admin console for a minute: PgBouncer is down, or refuses the exporter''s user. HAProxy health-checks Patroni, not PgBouncer, so it keeps sending clients to this node.'
+              summary: PgBouncer on n1 is not answering
+      - eval_time: 4m
+        alertname: PgBouncerClientsWaiting
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: integrations/pgbouncer
+              instance: n1
+              database: d
+              user: u
+            exp_annotations:
+              description: 'For 2 minutes, clients of pool d/u on n1 have waited over 5 seconds for a server connection: every server connection in the pool is busy. Raise the pool size, or find what holds its connections (long transactions, idle in transaction).'
+              summary: Clients wait 7s for a connection in PgBouncer pool d/u
+      - eval_time: 7m
+        alertname: PgBouncerClientConnectionsNearLimit
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: integrations/pgbouncer
+              instance: n1
+            exp_annotations:
+              description: At max_client_conn PgBouncer refuses new client connections.
+              summary: PgBouncer on n1 is at 90% of max_client_conn
+  - name: remaining patroni flags
+    interval: 1m
+    input_series:
+      - series: patroni_failsafe_mode_is_active{scope="s", name="n", instance="n"}
+        values: 1x80
+      - series: patroni_is_paused{scope="s", name="n", instance="n"}
+        values: 1x80
+      - series: patroni_pending_restart{scope="s", name="n", instance="n"}
+        values: 1x80
+      - series: patroni_xlog_paused{scope="s", name="n", instance="n"}
+        values: 1x80
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: PatroniFailsafeModeActive
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              scope: s
+              name: n
+              instance: n
+            exp_annotations:
+              description: n reports that the DCS is unavailable and failsafe mode is what keeps the primary running. No failover can happen until the DCS is back.
+              summary: Patroni cluster s is running in failsafe mode
+      - eval_time: 30m
+        alertname: PatroniClusterPaused
+        exp_alerts: []
+      - eval_time: 65m
+        alertname: PatroniClusterPaused
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              scope: s
+              name: n
+              instance: n
+            exp_annotations:
+              description: Maintenance mode is on, so Patroni does not fail over if the primary dies. Run patronictl resume when the maintenance is done.
+              summary: Patroni cluster s has been paused for over an hour
+      - eval_time: 65m
+        alertname: PatroniPendingRestart
+        exp_alerts:
+          - exp_labels:
+              severity: info
+              scope: s
+              name: n
+              instance: n
+            exp_annotations:
+              description: A parameter that only takes effect on restart has changed, so n (s) runs with a configuration other than the intended one. patronictl restart applies it.
+              summary: Postgres on n is waiting for a restart
+      - eval_time: 6m
+        alertname: PatroniWALReplayPaused
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              scope: s
+              name: n
+              instance: n
+            exp_annotations:
+              description: Replay has been paused on n (s) for 5 minutes, so the replica serves older and older data and has to catch up before it can take over. SELECT pg_wal_replay_resume() restarts it.
+              summary: WAL replay is paused on n
+  - name: remaining etcd rules
+    interval: 1m
+    input_series:
+      - series: etcd_server_has_leader{job="integrations/etcd", instance="e1"}
+        values: 1 0x10
+      - series: etcd_server_has_leader{job="integrations/etcd", instance="e2"}
+        values: 1x10
+      - series: etcd_server_leader_changes_seen_total{job="integrations/etcd", instance="e1"}
+        values: 0+0.34x30
+      - series: etcd_disk_wal_fsync_duration_seconds_bucket{job="integrations/etcd", instance="e1", le="0.512"}
+        values: '0x30'
+      - series: etcd_disk_wal_fsync_duration_seconds_bucket{job="integrations/etcd", instance="e1", le="1.024"}
+        values: 0+10x30
+      - series: etcd_disk_wal_fsync_duration_seconds_bucket{job="integrations/etcd", instance="e1", le="+Inf"}
+        values: 0+10x30
+      - series: grpc_server_handled_total{job="integrations/etcd", instance="e1", grpc_service="etcdserverpb.KV", grpc_method="Range", grpc_type="unary", grpc_code="OK"}
+        values: 0+100x30
+      - series: grpc_server_handled_total{job="integrations/etcd", instance="e1", grpc_service="etcdserverpb.KV", grpc_method="Range", grpc_type="unary", grpc_code="Unavailable"}
+        values: 0+5x30
+      # gRPC failures outside etcd do not count.
+      - series: grpc_server_handled_total{job="integrations/alloy", instance="e1", grpc_service="x", grpc_method="Push", grpc_type="unary", grpc_code="Unavailable"}
+        values: 0+50x30
+      - series: etcd_mvcc_db_total_size_in_bytes{job="integrations/etcd", instance="e1"}
+        values: 1.8e9x30
+      - series: etcd_server_quota_backend_bytes{job="integrations/etcd", instance="e1"}
+        values: 2e9x30
+      - series: etcd_mvcc_db_total_size_in_bytes{job="integrations/etcd", instance="e2"}
+        values: 1.95e9x30
+      - series: etcd_server_quota_backend_bytes{job="integrations/etcd", instance="e2"}
+        values: 2e9x30
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: EtcdNoLeader
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: integrations/etcd
+              instance: e1
+            exp_annotations:
+              description: 'The etcd member on e1 has seen no leader for a minute, usually because the cluster has lost quorum. Without one, Patroni cannot renew its leader key: the primary demotes itself once ttl expires, unless failsafe_mode is on.'
+              summary: etcd on e1 has no leader
+      - eval_time: 25m
+        alertname: EtcdHighNumberOfLeaderChanges
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: integrations/etcd
+              instance: e1
+            exp_annotations:
+              description: Frequent elections usually come from slow disks (see EtcdHighFsyncDurations) or a flapping network. Each one briefly blocks writes, Patroni's included.
+              summary: etcd on e1 saw 5 leader changes in 15 minutes
+      - eval_time: 20m
+        alertname: EtcdHighFsyncDurations
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: integrations/etcd
+              instance: e1
+            exp_annotations:
+              description: The 99th percentile WAL fsync on e1 has been over 500ms for 10 minutes and is now 1.019s; etcd wants under 10ms. Slow fsyncs delay heartbeats and set off leader elections. A disk shared with a busy Postgres is the usual cause.
+              summary: etcd on e1 has slow WAL fsyncs
+      - eval_time: 20m
+        alertname: EtcdHighNumberOfFailedGRPCRequests
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: integrations/etcd
+              instance: e1
+              grpc_service: etcdserverpb.KV
+              grpc_method: Range
+            exp_annotations:
+              description: More than 1% of etcdserverpb.KV/Range requests to etcd on e1 have failed for 10 minutes. Patroni's reads and writes of its keys are among these requests.
+              summary: etcd on e1 fails 4.8% of Range requests
+      - eval_time: 15m
+        alertname: EtcdDatabaseQuotaLowSpace
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: integrations/etcd
+              instance: e1
+            exp_annotations:
+              description: 'At its quota (--quota-backend-bytes) etcd raises a NOSPACE alarm and rejects every write, Patroni''s leader key included. Compact and defragment, then run etcdctl alarm disarm. Make sure auto-compaction is on: Patroni rewrites its keys on every HA loop.'
+              summary: etcd database on e1 is at 90% of its quota
+          - exp_labels:
+              severity: warning
+              job: integrations/etcd
+              instance: e2
+            exp_annotations:
+              description: 'At its quota (--quota-backend-bytes) etcd raises a NOSPACE alarm and rejects every write, Patroni''s leader key included. Compact and defragment, then run etcdctl alarm disarm. Make sure auto-compaction is on: Patroni rewrites its keys on every HA loop.'
+              summary: etcd database on e2 is at 97.5% of its quota
+          - exp_labels:
+              severity: critical
+              job: integrations/etcd
+              instance: e2
+            exp_annotations:
+              description: 'At its quota (--quota-backend-bytes) etcd raises a NOSPACE alarm and rejects every write, Patroni''s leader key included. Compact and defragment, then run etcdctl alarm disarm. Make sure auto-compaction is on: Patroni rewrites its keys on every HA loop.'
+              summary: etcd database on e2 is at 97.5% of its quota
+  - name: remaining haproxy and postgres rules
+    interval: 1m
+    input_series:
+      - series: haproxy_process_current_connections{instance="h1"}
+        values: 3500x10
+      - series: haproxy_process_max_connections{instance="h1"}
+        values: 4000x10
+      - series: haproxy_backend_current_queue{instance="h1", proxy="pg-primary"}
+        values: 0 3x10
+      - series: pg_stat_activity_count{job="integrations/postgres", instance="n1", datname="a", state="active"}
+        values: 195x10
+      - series: pg_settings_max_connections{job="integrations/postgres", instance="n1", server="x"}
+        values: 200x10
+      - series: pg_replication_lag_seconds{job="integrations/postgres", instance="n2"}
+        values: 120x10
+      - series: pg_stat_archiver_failed_count{job="integrations/postgres", instance="n1", server="x"}
+        values: 0+3x30
+      - series: pg_stat_database_deadlocks{job="integrations/postgres", instance="n1", datid="1", datname="a"}
+        values: 0+1x30
+      - series: pg_database_wraparound_age_datfrozenxid_seconds{job="integrations/postgres", instance="n1", datname="a"}
+        values: 1.6e9x30
+      - series: pg_database_wraparound_age_datminmxid_seconds{job="integrations/postgres", instance="n1", datname="a"}
+        values: 1e6x30
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: HAProxyProcessConnectionsNearLimit
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: h1
+            exp_annotations:
+              description: At the global maxconn HAProxy stops accepting connections on every frontend.
+              summary: HAProxy on h1 is at 87.5% of its global maxconn
+      - eval_time: 4m
+        alertname: HAProxyBackendQueueing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: h1
+              proxy: pg-primary
+            exp_annotations:
+              description: 'The queue of pg-primary has not emptied for 2 minutes: every server in it is at its maxconn. HAProxy drops a connection that waits longer than timeout queue, so clients are seeing errors.'
+              summary: Connections are queueing in HAProxy backend pg-primary on h1
+      - eval_time: 7m
+        alertname: PostgresConnectionsNearLimit
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: integrations/postgres
+              instance: n1
+            exp_annotations:
+              description: At max_connections Postgres refuses new connections from everyone but superusers. Find the client holding the most connections in pg_stat_activity, or the pooler in front of it.
+              summary: Postgres on n1 is using 97.5% of max_connections
+          - exp_labels:
+              severity: critical
+              job: integrations/postgres
+              instance: n1
+            exp_annotations:
+              description: At max_connections Postgres refuses new connections from everyone but superusers. Find the client holding the most connections in pg_stat_activity, or the pooler in front of it.
+              summary: Postgres on n1 is using 97.5% of max_connections
+      - eval_time: 7m
+        alertname: PostgresReplicationLagging
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: integrations/postgres
+              instance: n2
+            exp_annotations:
+              description: For 5 minutes the replica on n2 has held WAL it has not replayed yet, and its last replayed transaction is 2m 0s old. Reads from it are stale, and Patroni does not promote it while it lags past maximum_lag_on_failover. Replay usually waits on a long query on the replica (a recovery conflict) or a slow disk.
+              summary: Replica n2 is 2m 0s behind
+      - eval_time: 20m
+        alertname: PostgresWALArchivingFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: integrations/postgres
+              instance: n1
+              server: x
+            exp_annotations:
+              description: archive_command has kept failing on n1 for 10 minutes. Unarchived WAL piles up in pg_wal until the disk is full, and point-in-time recovery stops at the last archived segment. The Postgres log shows the command's error.
+              summary: WAL archiving is failing on n1
+      - eval_time: 12m
+        alertname: PostgresDeadlocks
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: integrations/postgres
+              instance: n1
+              datid: '1'
+              datname: a
+            exp_annotations:
+              description: 10 deadlocks in a in 10 minutes. Postgres breaks each one by aborting a transaction, so the application sees errors; the Postgres log records the statements involved.
+              summary: Deadlocks in a on n1
+      - eval_time: 16m
+        alertname: PostgresXIDWraparoundRisk
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: integrations/postgres
+              instance: n1
+              datname: a
+            exp_annotations:
+              description: 'A transaction or multixact ID in a on n1 has gone 1.6G IDs without being frozen. Postgres stops accepting writes as that age nears 2^31 (about 2.1G) to prevent wraparound; anti-wraparound autovacuum normally holds it near autovacuum_freeze_max_age (200M by default). Find what blocks freezing: a long transaction, an abandoned replication slot or prepared transaction, or a table whose autovacuum never finishes.'
+              summary: The oldest unfrozen ID in a on n1 is 1.6G old
+          - exp_labels:
+              severity: critical
+              job: integrations/postgres
+              instance: n1
+              datname: a
+            exp_annotations:
+              description: 'A transaction or multixact ID in a on n1 has gone 1.6G IDs without being frozen. Postgres stops accepting writes as that age nears 2^31 (about 2.1G) to prevent wraparound; anti-wraparound autovacuum normally holds it near autovacuum_freeze_max_age (200M by default). Find what blocks freezing: a long transaction, an abandoned replication slot or prepared transaction, or a table whose autovacuum never finishes.'
+              summary: The oldest unfrozen ID in a on n1 is 1.6G old
