@@ -64,6 +64,33 @@
 // depending on how the component matches its prefix, a cluster still running
 // the bare "alloy" default may claim those as its own and delete them.
 //
+// CLUSTER SCOPE -- the ruler evaluates a rule over the whole TENANT, not over
+// the cluster that synced it. On a tenant shared by several clusters, a rule
+// that does not name its cluster in every selector (vendored mixins -- Ceph,
+// node, kube-state -- usually don't) sees every cluster's series: it alerts on
+// other clusters too, and joins/aggregations written for one cluster
+// (count(...), avg by (job), on (ceph_daemon)) mix clusters or fail on
+// duplicate series. k8s_alert.metrics_scoped limits one cluster's rules to
+// that cluster:
+//   - every vector selector of every rule gets {cluster_name="<cluster_name>"}
+//     (extra_query_matchers), and
+//   - every alert and recorded series gets cluster_name="<cluster_name>"
+//     (external_labels), also where a rule aggregates the label away, so
+//     recording rules stay visible to the scoped queries that read them.
+// The matcher REPLACES any cluster_name matcher a rule already has, so a rule
+// written for another cluster, or for all of them, is rewritten to this one:
+// sync such fleet-wide rules with k8s_alert.metrics instead. Annotation
+// templates that run their own query ({{ query "..." }}) are not rewritten.
+//
+// Observed on a shared tenant 2026-09-28: one cluster's vendored Ceph rules
+// raised CephNodeDiskspaceWarning for a node of another cluster that runs no
+// Ceph at all.
+//
+// It is a separate declare, not an optional argument of k8s_alert.metrics,
+// because Alloy cannot make a block conditional, and a match-all default
+// (cluster_name=~".*") would still replace every existing cluster_name
+// matcher.
+//
 // Requirements:
 //   - RBAC: get/list/watch on the PrometheusRule CRD and namespaces.
 //   - A reachable Mimir ruler (for .metrics) and/or Loki ruler (for .logs).
@@ -76,6 +103,10 @@
 //       endpoint_basic_auth_username = sys.env("AUTH_BASIC_USERNAME")
 //       endpoint_basic_auth_password = sys.env("AUTH_BASIC_PASSWORD")
 //       namespace_prefix             = sys.env("CLUSTER_NAME")
+//   }
+//   k8s_alert.metrics_scoped "my_tenant" {   // instead of .metrics, see CLUSTER SCOPE
+//       ...same arguments as k8s_alert.metrics, plus:
+//       cluster_name                 = sys.env("CLUSTER_NAME")
 //   }
 //   k8s_alert.logs "my_tenant" {
 //       namespaces                   = ["my-namespace"]
@@ -161,6 +192,93 @@ declare "metrics" {
 		// both sync to Mimir; only grafana.com/rules-type=logs is excluded. This
 		// keeps the default backward-compatible: a rule author must opt IN to
 		// the Loki ruler with the logs label, but needs no label for Mimir.
+		rule_selector {
+			match_expression {
+				key      = "grafana.com/rules-type"
+				operator = "NotIn"
+				values   = ["logs"]
+			}
+		}
+	}
+}
+
+// k8s_alert.metrics_scoped -- k8s_alert.metrics limited to one cluster's
+// series (see CLUSTER SCOPE in the header).
+declare "metrics_scoped" {
+	// -- Required -----------------------------------------------------------
+	argument "namespaces" {
+		comment = "The namespaces to discover PrometheusRule CRDs in"
+	}
+
+	argument "tenant_id" {
+		comment = "The tenant (X-Scope-OrgID) the rules are synced under"
+	}
+
+	argument "ruler_endpoint" {
+		comment = "Mimir ruler endpoint for metric alerting/recording rules"
+	}
+
+	argument "endpoint_basic_auth_username" {
+		comment = "Basic-auth username for the ruler endpoint"
+	}
+
+	argument "endpoint_basic_auth_password" {
+		comment = "Basic-auth password for the ruler endpoint"
+	}
+
+	argument "cluster_name" {
+		comment = "This cluster's cluster_name label value: every rule query is limited to it, and every alert and recorded series carries it"
+	}
+
+	// -- Optional -----------------------------------------------------------
+	argument "sync_interval" {
+		comment  = "How often to reconcile CRDs into the ruler (default: \"5m\")"
+		optional = true
+	}
+
+	argument "namespace_prefix" {
+		comment  = "Ruler namespace prefix this cluster OWNS and prunes (default: \"alloy\"). MUST be unique per cluster on a shared tenant -- see the header; the default deletes other clusters' rules. Use the cluster name."
+		optional = true
+	}
+
+	mimir.rules.kubernetes "metrics" {
+		address   = argument.ruler_endpoint.value
+		tenant_id = argument.tenant_id.value
+
+		sync_interval          = coalesce(argument.sync_interval.value, "5m")
+		mimir_namespace_prefix = coalesce(argument.namespace_prefix.value, "alloy")
+
+		// Every alert and recorded series carries this cluster, also where a
+		// rule aggregates cluster_name away.
+		external_labels = {
+			cluster_name = argument.cluster_name.value,
+		}
+
+		basic_auth {
+			username = argument.endpoint_basic_auth_username.value
+			password = argument.endpoint_basic_auth_password.value
+		}
+
+		// Limit every vector selector of every rule to this cluster's series.
+		// An empty cluster_name fails validation here instead of matching the
+		// series that have no cluster_name.
+		extra_query_matchers {
+			matcher {
+				name       = "cluster_name"
+				match_type = "="
+				value      = argument.cluster_name.value
+			}
+		}
+
+		// Namespace and rule selection as in k8s_alert.metrics.
+		rule_namespace_selector {
+			match_expression {
+				key      = "kubernetes.io/metadata.name"
+				operator = "In"
+				values   = argument.namespaces.value
+			}
+		}
+
 		rule_selector {
 			match_expression {
 				key      = "grafana.com/rules-type"
