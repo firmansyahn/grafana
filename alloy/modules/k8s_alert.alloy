@@ -102,11 +102,11 @@
 //       ruler_endpoint               = sys.env("MIMIR_ENDPOINT")
 //       endpoint_basic_auth_username = sys.env("AUTH_BASIC_USERNAME")
 //       endpoint_basic_auth_password = sys.env("AUTH_BASIC_PASSWORD")
-//       namespace_prefix             = sys.env("CLUSTER_NAME")
+//       namespace_prefix             = sys.env("K8S_CLUSTER_NAME")
 //   }
 //   k8s_alert.metrics_scoped "my_tenant" {   // instead of .metrics, see CLUSTER SCOPE
 //       ...same arguments as k8s_alert.metrics, plus:
-//       cluster_name                 = sys.env("CLUSTER_NAME")
+//       cluster_name                 = sys.env("K8S_CLUSTER_NAME")
 //   }
 //   k8s_alert.logs "my_tenant" {
 //       namespaces                   = ["my-namespace"]
@@ -114,7 +114,7 @@
 //       ruler_endpoint               = sys.env("LOKI_ENDPOINT")
 //       endpoint_basic_auth_username = sys.env("AUTH_BASIC_USERNAME")
 //       endpoint_basic_auth_password = sys.env("AUTH_BASIC_PASSWORD")
-//       namespace_prefix             = sys.env("CLUSTER_NAME")
+//       namespace_prefix             = sys.env("K8S_CLUSTER_NAME")
 //   }
 // metrics and logs are split into two independent declares (rather than one
 // that hardcodes both rulers) so a caller instantiates ONLY the backends it

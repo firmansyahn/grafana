@@ -44,7 +44,7 @@
 //       logs_forward_to    = [k8s_otel.tenant_route.acme.logs_input]
 //       traces_forward_to  = [k8s_otel.tenant_route.acme.traces_input]
 //       metrics_forward_to = [k8s_otel.tenant_route.acme.metrics_input]
-//       cluster_name       = sys.env("CLUSTER_NAME")
+//       cluster_name       = sys.env("K8S_CLUSTER_NAME")
 //   }
 declare "default" {
 	// -- Required -----------------------------------------------------------
