@@ -59,7 +59,7 @@ declare "kubernetes" {
 	}
 
 	argument "cluster_name" {
-		comment  = "Value for the static cluster_name label (default: sys.env(\"CLUSTER_NAME\"))"
+		comment  = "Value for the static cluster_name label (default: sys.env(\"K8S_CLUSTER_NAME\"))"
 		optional = true
 	}
 
@@ -411,7 +411,7 @@ declare "kubernetes" {
 		// Static cluster_name label.
 		stage.static_labels {
 			values = {
-				cluster_name = coalesce(argument.cluster_name.value, sys.env("CLUSTER_NAME")),
+				cluster_name = coalesce(argument.cluster_name.value, sys.env("K8S_CLUSTER_NAME")),
 			}
 		}
 

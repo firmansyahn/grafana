@@ -293,7 +293,7 @@ declare "unix" {
 //       endpoint_basic_auth_password = sys.env("AUTH_BASIC_PASSWORD")
 //       region                       = sys.env("REGION")
 //       zone                         = sys.env("ZONE")
-//       cluster_name                 = sys.env("CLUSTER_NAME")
+//       cluster_name                 = sys.env("K8S_CLUSTER_NAME")
 //   }
 declare "kubelet" {
 	// -- Required -----------------------------------------------------------
@@ -675,7 +675,7 @@ declare "kubelet" {
 //       endpoint_basic_auth_password = sys.env("AUTH_BASIC_PASSWORD")
 //       region                       = sys.env("REGION")
 //       zone                         = sys.env("ZONE")
-//       cluster_name                 = sys.env("CLUSTER_NAME")
+//       cluster_name                 = sys.env("K8S_CLUSTER_NAME")
 //   }
 declare "control_plane" {
 	// -- Required -----------------------------------------------------------

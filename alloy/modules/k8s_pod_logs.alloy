@@ -176,7 +176,7 @@ declare "kubernetes" {
 
 		stage.static_labels {
 			values = {
-				cluster_name = sys.env("CLUSTER_NAME"),
+				cluster_name = sys.env("K8S_CLUSTER_NAME"),
 			}
 		}
 
