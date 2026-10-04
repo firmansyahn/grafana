@@ -12,12 +12,23 @@
 //
 // Features:
 //   - Node-local discovery via a spec.nodeName field selector.
+//   - Strips the trailing newline the API leaves on each line, and drops
+//     empty lines.
 //   - Normalized `level` label (klog / JSON / logfmt detection).
 //   - Multi-tenant: stamps the Loki tenant via stage.tenant.
 //
-// This module intentionally does NOT redact or drop lines — those rules are
-// site-specific. To add them, point `forward_to` at your own loki.process
-// (redaction/drops) which then forwards to loki.write.
+// Baseline drops and redactions, always on:
+//   - Drops health-check lines: any line naming kube-probe,
+//     ELB-HealthChecker, GoogleHC or Consul Health Check, access-log lines
+//     for /healthz, /livez, /readyz, /health, /ping, /-/healthy or /-/ready,
+//     and any line with /actuator/health.
+//   - Replaces base64 PNG, JPEG and WebP data: URIs, and a WebP image in an
+//     imageBase64 JSON field, with [REDUCED].
+//   - Replaces access-token, signature and x-envoy-peer-metadata values with
+//     [REDACTED], and AWS access key IDs and secret keys with
+//     [REDACTED_AWS_KEY_ID] and [REDACTED_AWS_SECRET].
+// Site-specific drops and redactions go in your own loki.process: point
+// `forward_to` at it, and have it forward to loki.write.
 //
 // Note: unlike k8s_pod_logs_file, there is no `stream` label — the API log
 // endpoint does not expose the stdout/stderr stream separately.
@@ -138,6 +149,17 @@ declare "kubernetes" {
 
 	loki.process "pods" {
 		forward_to = argument.forward_to.value
+
+		// The API hands each line over with its trailing newline.
+		stage.replace {
+			expression = `(\s+)$`
+			replace    = ""
+		}
+
+		stage.drop {
+			expression          = `^$`
+			drop_counter_reason = "empty"
+		}
 
 		// Log level extraction. Default unknown, detect klog / JSON / logfmt
 		// level tokens, then normalize aliases and case.
