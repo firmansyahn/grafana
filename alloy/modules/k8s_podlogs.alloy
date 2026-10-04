@@ -261,9 +261,9 @@ declare "kubernetes" {
 			}
 		}
 
-		// JSON / logfmt: "level":"info", level=info, lvl=info, severity=error.
-		// k8s_pod_logs_file's version misses a bare level=; \b keeps it from
-		// matching inside a longer key such as loglevel.
+		// JSON / logfmt: "level":"info", level=info, "lvl":"info",
+		// severity=error. The key may be quoted; \b keeps it from matching
+		// inside a longer key such as loglevel.
 		stage.match {
 			selector = `{level="unknown"} |~ "(?i)\\b(level|lvl|severity)\"?\\s*[:=]\\s*\"?(trace|debug|info|warn|warning|error|err|fatal|crit|critical)"`
 
