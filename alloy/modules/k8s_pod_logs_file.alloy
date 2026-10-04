@@ -309,12 +309,14 @@ declare "kubernetes" {
 			}
 		}
 
-		// JSON / logfmt: "level":"info", lvl=info, severity=error
+		// JSON / logfmt: "level":"info", level=info, "lvl":"info",
+		// severity=error. The key may be quoted; \b keeps it from matching
+		// inside a longer key such as loglevel.
 		stage.match {
-			selector = "{level=\"unknown\"} |~ \"(?i)(\\\"level\\\"|lvl|severity)\\\\s*[:=]\\\\s*\\\"?(trace|debug|info|warn|warning|error|err|fatal|crit|critical)\\\"?\""
+			selector = `{level="unknown"} |~ "(?i)\\b(level|lvl|severity)\"?\\s*[:=]\\s*\"?(trace|debug|info|warn|warning|error|err|fatal|crit|critical)"`
 
 			stage.regex {
-				expression = "(?i)(\"level\"|lvl|severity)\\s*[:=]\\s*\"?(?P<level>trace|debug|info|warn|warning|error|err|fatal|crit|critical)\"?"
+				expression = `(?i)\b(level|lvl|severity)"?\s*[:=]\s*"?(?P<level>trace|debug|info|warn|warning|error|err|fatal|crit|critical)`
 			}
 
 			stage.labels {
