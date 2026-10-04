@@ -1,0 +1,332 @@
+// k8s_podlogs
+//
+// Kubernetes pod logs selected by PodLogs resources
+// (monitoring.grafana.com/v1alpha2) and tailed through the Kubernetes API
+// with loki.source.podlogs. Use it for workloads that ship their own
+// selection as a PodLogs resource, such as a chart's templates/PodLogs.yaml:
+// the resource picks the pods and containers, and its relabelings can add
+// labels of their own. For everything else, k8s_pod_logs_file is the bulk
+// path; it reads the node's files and puts no load on the API server.
+//
+// Tenancy: namespaces names the namespaces whose PodLogs resources this
+// instance reads, and it is also the only place their pods may come from. A
+// PodLogs resource's own namespaceSelector decides where its pods are found,
+// and when it is empty that is EVERY namespace (Alloy lists pods across the
+// cluster and filters them only by the resource's selectors). So lines from
+// a pod outside namespaces are dropped here, before they can reach this
+// instance's tenant. Alloy still tails such a pod. This covers a careless
+// resource, not a hostile one: a relabeling that rewrites the namespace
+// labels themselves can still get past it, so who may create PodLogs
+// resources stays an RBAC question.
+//
+// Node-local: each Alloy tails only the pods on its own node (node_filter),
+// like k8s_pod_logs_file, so run it on every pod of a DaemonSet. There is no
+// clustering block: it would hand a pod to a peer on another node, whose node
+// filter then drops it.
+//
+// Don't list a namespace here and in a k8s_pod_logs_file instance too: both
+// would ship the same lines.
+//
+// Labels, the same as k8s_pod_logs_file's:
+//   namespace, container, node  from the pod; always set here, whatever the
+//                               resource's relabelings did
+//   app           the label a relabeling set, else the pod's
+//                 app.kubernetes.io/name label, else the container name
+//   job           <namespace>/<container>
+//   level         from a klog prefix or a JSON / logfmt level, lvl or severity
+//                 field: fatal, critical, error, warn, info, debug, trace, or
+//                 unknown
+//   cluster_name
+//   ...plus any label a relabeling adds, such as ceph_daemon.
+// There is no stream label: the API does not tell stdout from stderr. The
+// instance label (one per pod) is dropped.
+// Structured metadata:
+//   pod, node_ip  queryable with `| pod="..."` without a stream per pod
+//   podlogs       the PodLogs resource that selected the pod, <namespace>/<name>
+//
+// Lines arrive without the container runtime's envelope and with a trailing
+// newline, which is stripped; empty lines are dropped. Multi-line records are
+// not joined, and app-specific parsing and drops belong to the caller: point
+// forward_to at your own loki.process, which then forwards to loki.write.
+// Lines it still sees at level "unknown" are the ones this module could not
+// classify.
+//
+// Requirements:
+//   - The PodLogs CRD (monitoring.grafana.com/v1alpha2), which the Grafana
+//     Alloy Helm chart installs.
+//   - RBAC: get/list/watch on podlogs, pods and namespaces, and get on
+//     pods/log.
+//   - K8S_NODE_NAME exposed to the collector (the Grafana Alloy Helm chart
+//     injects this automatically from spec.nodeName); or pass node_name.
+//   - Loki with allow_structured_metadata: true (tsdb + schema v13).
+//
+// Usage:
+//   k8s_podlogs.kubernetes "my_tenant" {
+//       namespaces = ["my-namespace"]
+//       tenant_id  = "my-tenant"
+//       forward_to = [loki.write.default.receiver]
+//   }
+declare "kubernetes" {
+	// -- Required -----------------------------------------------------------
+	argument "forward_to" {
+		comment = "Must be a list(LogsReceiver) where collected logs should be forwarded to"
+	}
+
+	argument "tenant_id" {
+		comment = "The Loki tenant (X-Scope-OrgID) to stamp on collected logs"
+	}
+
+	argument "namespaces" {
+		comment = "The namespaces whose PodLogs resources to read, and the only namespaces whose pods are shipped"
+	}
+
+	// -- Optional -----------------------------------------------------------
+	argument "node_name" {
+		comment  = "The node whose pods to tail (default: sys.env(\"K8S_NODE_NAME\"), injected by the Alloy Helm chart)"
+		optional = true
+	}
+
+	argument "cluster_name" {
+		comment  = "Value for the static cluster_name label (default: sys.env(\"K8S_CLUSTER_NAME\"))"
+		optional = true
+	}
+
+	argument "tail_from_end" {
+		comment  = "Start a newly found container at the end of its log rather than at the start of what the kubelet still holds, which can go back days and which Loki rejects as too old (default: true)"
+		default  = true
+		optional = true
+	}
+
+	loki.source.podlogs "pods" {
+		namespace_selector {
+			match_expression {
+				key      = "kubernetes.io/metadata.name"
+				operator = "In"
+				values   = argument.namespaces.value
+			}
+		}
+
+		// The component's own fallback is NODE_NAME, which the Alloy Helm
+		// chart does not set.
+		node_filter {
+			enabled   = true
+			node_name = coalesce(argument.node_name.value, sys.env("K8S_NODE_NAME"))
+		}
+
+		tail_from_end = argument.tail_from_end.value
+
+		// Keeps the __meta_kubernetes_* labels, after the resource's
+		// relabelings, so loki.relabel below can check the namespace and set
+		// the standard labels. It drops them all afterwards.
+		preserve_discovered_labels = true
+
+		forward_to = [loki.relabel.pods.receiver]
+	}
+
+	loki.relabel "pods" {
+		forward_to = [loki.process.pods.receiver]
+
+		// Tenancy: only pods in namespaces. The regex is anchored, and
+		// namespace names hold no regex metacharacters.
+		rule {
+			source_labels = ["__meta_kubernetes_namespace"]
+			regex         = string.join(argument.namespaces.value, "|")
+			action        = "keep"
+		}
+
+		rule {
+			source_labels = ["__meta_kubernetes_namespace"]
+			target_label  = "namespace"
+		}
+
+		rule {
+			source_labels = ["__meta_kubernetes_pod_container_name"]
+			target_label  = "container"
+		}
+
+		rule {
+			source_labels = ["__meta_kubernetes_pod_node_name"]
+			target_label  = "node"
+		}
+
+		// Demoted to structured metadata in loki.process.
+		rule {
+			source_labels = ["__meta_kubernetes_pod_name"]
+			target_label  = "pod"
+		}
+
+		rule {
+			source_labels = ["__meta_kubernetes_pod_host_ip"]
+			target_label  = "node_ip"
+		}
+
+		rule {
+			source_labels = ["__meta_kubernetes_podlogs_namespace", "__meta_kubernetes_podlogs_name"]
+			separator     = "/"
+			target_label  = "podlogs"
+		}
+
+		// Replaces Alloy's default job, the PodLogs resource's
+		// <namespace>/<name>, which is kept as podlogs above.
+		rule {
+			source_labels = ["__meta_kubernetes_namespace", "__meta_kubernetes_pod_container_name"]
+			separator     = "/"
+			target_label  = "job"
+		}
+
+		// app: kept when a relabeling set it. Otherwise each rule fills it only
+		// while it is still empty: the joined value starts with ";" exactly
+		// when app is empty.
+		rule {
+			source_labels = ["app", "__meta_kubernetes_pod_label_app_kubernetes_io_name"]
+			separator     = ";"
+			regex         = "^;(.+)$"
+			replacement   = "$1"
+			target_label  = "app"
+		}
+
+		rule {
+			source_labels = ["app", "__meta_kubernetes_pod_container_name"]
+			separator     = ";"
+			regex         = "^;(.+)$"
+			replacement   = "$1"
+			target_label  = "app"
+		}
+
+		rule {
+			action = "labeldrop"
+			regex  = "__meta_.+|instance"
+		}
+	}
+
+	loki.process "pods" {
+		forward_to = argument.forward_to.value
+
+		// The API hands each line over with its trailing newline.
+		stage.replace {
+			expression = `(\s+)$`
+			replace    = ""
+		}
+
+		stage.drop {
+			expression          = `^$`
+			drop_counter_reason = "empty"
+		}
+
+		// Log level extraction, as in k8s_pod_logs_file. Default unknown,
+		// detect klog / JSON / logfmt level tokens, then normalize aliases and
+		// case.
+		stage.static_labels {
+			values = {
+				level = "unknown",
+			}
+		}
+
+		// klog: single-letter level + MMDD, e.g. "I0119 ..." -> I/W/E/F
+		stage.match {
+			selector = "{level=\"unknown\"} |~ \"([IWEF][0-9]{4}\\\\s+[0-9]{2}:[0-9]{2}:[0-9]{2}\\\\.[0-9]+)\""
+
+			stage.regex {
+				expression = "((?P<level>[IWEF])[0-9])"
+			}
+
+			stage.labels {
+				values = {
+					level = "",
+				}
+			}
+
+			stage.replace {
+				source     = "level"
+				expression = "(I)"
+				replace    = "info"
+			}
+
+			stage.replace {
+				source     = "level"
+				expression = "(W)"
+				replace    = "warn"
+			}
+
+			stage.replace {
+				source     = "level"
+				expression = "(E)"
+				replace    = "error"
+			}
+
+			stage.replace {
+				source     = "level"
+				expression = "(F)"
+				replace    = "fatal"
+			}
+		}
+
+		// JSON / logfmt: "level":"info", level=info, lvl=info, severity=error.
+		// k8s_pod_logs_file's version misses a bare level=; \b keeps it from
+		// matching inside a longer key such as loglevel.
+		stage.match {
+			selector = `{level="unknown"} |~ "(?i)\\b(level|lvl|severity)\"?\\s*[:=]\\s*\"?(trace|debug|info|warn|warning|error|err|fatal|crit|critical)"`
+
+			stage.regex {
+				expression = `(?i)\b(level|lvl|severity)"?\s*[:=]\s*"?(?P<level>trace|debug|info|warn|warning|error|err|fatal|crit|critical)`
+			}
+
+			stage.labels {
+				values = {
+					level = "",
+				}
+			}
+		}
+
+		// Normalize aliases and case.
+		stage.replace {
+			source     = "level"
+			expression = "(?i)^(warning)$"
+			replace    = "warn"
+		}
+
+		stage.replace {
+			source     = "level"
+			expression = "(?i)^(err)$"
+			replace    = "error"
+		}
+
+		stage.replace {
+			source     = "level"
+			expression = "(?i)^(crit|critical)$"
+			replace    = "critical"
+		}
+
+		stage.template {
+			source   = "level"
+			template = "{{ ToLower .Value }}"
+		}
+
+		stage.labels {
+			values = {
+				level = "",
+			}
+		}
+
+		stage.static_labels {
+			values = {
+				cluster_name = coalesce(argument.cluster_name.value, sys.env("K8S_CLUSTER_NAME")),
+			}
+		}
+
+		// Adding a label as structured metadata removes it from the stream
+		// labels: pod and node_ip churn with every pod, and podlogs is the same
+		// on every line of a resource.
+		stage.structured_metadata {
+			values = {
+				pod     = "",
+				node_ip = "",
+				podlogs = "",
+			}
+		}
+
+		stage.tenant {
+			value = argument.tenant_id.value
+		}
+	}
+}
