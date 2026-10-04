@@ -59,6 +59,7 @@ The modules are written for and checked against Alloy v1.19.2.
 | `k8s_pod_logs_file` | `kubernetes` | Pod logs tailed from `/var/log/pods` on the local node | `forward_to` |
 | `k8s_pod_logs_api` | `kubernetes` | Pod logs of the local node's pods, streamed through the API server | `forward_to` |
 | `k8s_pod_logs` | `kubernetes` | Pod logs through the API server, with fixed health-check drops and redactions | `forward_to` |
+| `k8s_podlogs` | `kubernetes` | Logs of the local node's pods that PodLogs resources select, streamed through the API server, limited to a tenant's namespaces | `forward_to` |
 | `k8s_events` | `kubernetes` | Kubernetes events as log lines: Warnings, plus node condition changes, by default | `forward_to` |
 | `k8s_alert` | `metrics`, `metrics_scoped`, `logs` | Syncs PrometheusRule CRDs into the Mimir ruler (PromQL) and the Loki ruler (LogQL) | The rulers' APIs |
 | `k8s_otel` | `default`, `tenant_route` | An OTLP gateway on ports 4317 and 4318 that adds Kubernetes attributes, and per-tenant routes with service graph and span metrics | OTLP exporters and remote_write |
@@ -80,10 +81,10 @@ The modules are written for and checked against Alloy v1.19.2.
 ## Conventions
 
 - **Tenants.** A module stamps the tenant you pass as `tenant_id` on everything it sends, so one Alloy can serve several tenants side by side. The Kubernetes modules are usually instantiated once per tenant, each with that tenant's `namespaces`.
-- **Node-local collection.** `host_metrics`, `host_logs`, `k8s_pod_logs_file`, `k8s_pod_logs_api`, `postgres_metrics` and `mongodb_metrics` collect only from the node they run on. Run them as a DaemonSet on Kubernetes, or as one container per host under Docker or Podman. Each module's header lists the mounts and flags it needs. The node name comes from `node_name`, else `K8S_NODE_NAME`, which the Grafana Alloy Helm chart sets. Outside Kubernetes, the host and database modules fall back to the hostname.
+- **Node-local collection.** `host_metrics`, `host_logs`, `k8s_pod_logs_file`, `k8s_pod_logs_api`, `k8s_podlogs`, `postgres_metrics` and `mongodb_metrics` collect only from the node they run on. Run them as a DaemonSet on Kubernetes, or as one container per host under Docker or Podman. Each module's header lists the mounts and flags it needs. The node name comes from `node_name`, else `K8S_NODE_NAME`, which the Grafana Alloy Helm chart sets. Outside Kubernetes, the host and database modules fall back to the hostname.
 - **Clustering.** Node-local declares turn clustering off, so every Alloy keeps its own node's data. Cluster-wide work, such as `k8s_metrics` scrapes and `k8s_events` watches, is split across clustered Alloy peers.
-- **Shared labels.** `node` is the same on a host's metrics and its logs, so the two join. `cluster_name`, `region` and `zone` come from arguments. `k8s_pod_logs`, `k8s_pod_logs_file` and `k8s_pod_logs_api` take `cluster_name` from `K8S_CLUSTER_NAME` when it is not passed.
-- **Structured metadata.** `host_logs`, `k8s_pod_logs_file` and `k8s_events` keep high-cardinality fields (pid, pod, object name) as Loki structured metadata instead of labels. That needs Loki with `allow_structured_metadata: true` (TSDB index, schema v13).
+- **Shared labels.** `node` is the same on a host's metrics and its logs, so the two join. `cluster_name`, `region` and `zone` come from arguments. `k8s_pod_logs`, `k8s_pod_logs_file`, `k8s_pod_logs_api` and `k8s_podlogs` take `cluster_name` from `K8S_CLUSTER_NAME` when it is not passed.
+- **Structured metadata.** `host_logs`, `k8s_pod_logs_file`, `k8s_podlogs` and `k8s_events` keep high-cardinality fields (pid, pod, object name) as Loki structured metadata instead of labels. That needs Loki with `allow_structured_metadata: true` (TSDB index, schema v13).
 
 ## Alerting rules
 
