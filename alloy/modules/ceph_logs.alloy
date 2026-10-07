@@ -1,0 +1,233 @@
+// ceph_logs
+//
+// A loki.process for the logs of Ceph and Rook pods. It drops the lines that
+// Ceph's own metrics already cover, and sets the level on the Ceph and Rook
+// log formats that the pod log modules leave at "unknown". Chain it after
+// k8s_podlogs, with a PodLogs resource that selects the Rook namespace:
+//
+//   k8s_podlogs.kubernetes "ceph" {
+//       namespaces = ["rook-ceph"]
+//       tenant_id  = "my-tenant"
+//       forward_to = [ceph_logs.process.default.receiver]
+//   }
+//
+//   ceph_logs.process "default" {
+//       forward_to = [loki.write.default.receiver]
+//   }
+//
+// It needs two labels from upstream:
+//   app    Rook's own pod label app (rook-ceph-mon, rook-ceph-mgr,
+//          rook-ceph-rgw, rook-ceph-exporter, ...). Set it with a PodLogs
+//          relabeling from __meta_kubernetes_pod_label_app; k8s_podlogs keeps
+//          an app label that a relabeling set.
+//   level  "unknown" on lines the upstream module could not classify, as
+//          k8s_podlogs and k8s_pod_logs_file leave them.
+// The drops match by app, and the level stages only by the Ceph and Rook log
+// formats, so lines of other pods pass through unchanged. The tenant is
+// already stamped on each line, so one instance can serve every tenant.
+//
+// Drops, each counted under its own drop_counter_reason:
+//   ceph_pgmap           the mgr's pgmap line, every 2 seconds
+//   ceph_audit_read      the mons' audit [DBG] lines for read-only commands
+//                        (status, df, osd dump, ...), several a second from
+//                        Rook and the mgr modules. Commands that change
+//                        something are audit [INF] and stay.
+//   ceph_rgw_request     RGW's "starting new request" and "req done" lines,
+//                        two of the three it logs per S3 request at debug
+//                        level 1. They never say more than the access line.
+//   ceph_rgw_access_ok   RGW access lines for 2xx and 3xx responses; 4xx and
+//                        5xx stay. An RGW that is the object store of a busy
+//                        backend logs thousands of these a minute.
+//   ceph_exporter_noise  ceph-exporter's "system:0", every 5 seconds per node
+//
+// Levels, for lines still at "unknown":
+//   Ceph cluster and audit log entries carry their own:
+//     [DBG] debug, [INF] info, [WRN] warn, [ERR] error, [SEC] warn
+//   Other Ceph daemon lines carry a message priority after the thread id:
+//     -1 error (derr), 0 info, anything higher debug
+//   The Rook operator logs in capnslog style:
+//     C critical, E error, W warn, N and I info, D and T debug
+// klog lines (the CSI plugins) and JSON or logfmt levels are the pod log
+// modules' job.
+//
+// Structured metadata: ceph_fsid, when a relabeling sets it. A ceph_cluster
+// label already tells Ceph clusters apart; the fsid settles a doubt without
+// adding streams.
+//
+// Multi-line blocks, such as RocksDB stats, are not joined.
+//
+// Usage: see above. forward_to is usually a loki.write, or a loki.process of
+// your own that forwards to one.
+declare "process" {
+	argument "forward_to" {
+		comment = "Must be a list(LogsReceiver) where processed logs should be forwarded to"
+	}
+
+	export "receiver" {
+		value = loki.process.ceph.receiver
+	}
+
+	loki.process "ceph" {
+		forward_to = argument.forward_to.value
+
+		stage.match {
+			selector            = "{app=~\"rook-ceph-(mon|mgr)\"} |~ \"\\\\[DBG\\\\] (: )?pgmap v[0-9]+\""
+			action              = "drop"
+			drop_counter_reason = "ceph_pgmap"
+		}
+
+		stage.match {
+			selector            = "{app=~\"rook-ceph-(mon|mgr)\"} |~ \"(audit|log_channel\\\\(audit\\\\) log) \\\\[DBG\\\\] (: )?from=\""
+			action              = "drop"
+			drop_counter_reason = "ceph_audit_read"
+		}
+
+		stage.match {
+			selector            = "{app=\"rook-ceph-rgw\"} |~ \"====== (starting new request|req done) \""
+			action              = "drop"
+			drop_counter_reason = "ceph_rgw_request"
+		}
+
+		stage.match {
+			selector            = "{app=\"rook-ceph-rgw\"} |~ \"beast: .* HTTP/[0-9.]+. [23][0-9]{2} \""
+			action              = "drop"
+			drop_counter_reason = "ceph_rgw_access_ok"
+		}
+
+		stage.match {
+			selector            = "{app=\"rook-ceph-exporter\"} |~ \"^system:0$\""
+			action              = "drop"
+			drop_counter_reason = "ceph_exporter_noise"
+		}
+
+		// Ceph cluster and audit log entries:
+		//   debug 2026-10-03T06:12:01.123+0000 7f2a... 0 log_channel(cluster) log [WRN] : Health check failed: ...
+		//   cluster 2026-10-03T06:12:01.123+0000 mon.a (mon.0) 1234 : cluster [WRN] Health check failed: ...
+		stage.match {
+			selector = "{level=\"unknown\"} |~ \"^(debug .* log_channel\\\\(|(cluster|audit) [0-9]{4}-).* \\\\[(DBG|INF|WRN|ERR|SEC)\\\\] \""
+
+			stage.regex {
+				expression = `^(?:debug \S+ \S+ +-?\d+ log_channel\(\w+\) log|(?:cluster|audit) \S+ .+? : \w+) \[(?P<level_raw>DBG|INF|WRN|ERR|SEC)\] `
+			}
+
+			stage.replace {
+				source     = "level_raw"
+				expression = "^(DBG)$"
+				replace    = "debug"
+			}
+
+			stage.replace {
+				source     = "level_raw"
+				expression = "^(INF)$"
+				replace    = "info"
+			}
+
+			stage.replace {
+				source     = "level_raw"
+				expression = "^(WRN|SEC)$"
+				replace    = "warn"
+			}
+
+			stage.replace {
+				source     = "level_raw"
+				expression = "^(ERR)$"
+				replace    = "error"
+			}
+
+			stage.labels {
+				values = {
+					level = "level_raw",
+				}
+			}
+		}
+
+		// Other Ceph daemon lines. Ceph pads the priority to two characters.
+		//   debug 2026-10-03T06:12:01.123+0000 7f2a...  1 osd.3 1234 tick
+		//   debug 2026-10-03T06:12:01.123+0000 7f2a... -1 bluestore(...) log_latency slow operation observed ...
+		stage.match {
+			selector = "{level=\"unknown\"} |~ \"^debug [^ ]+ [^ ]+ +-?[0-9]+ \""
+
+			stage.regex {
+				expression = `^debug \S+ \S+ +(?P<level_raw>-?\d+) `
+			}
+
+			stage.replace {
+				source     = "level_raw"
+				expression = "^(-1)$"
+				replace    = "error"
+			}
+
+			stage.replace {
+				source     = "level_raw"
+				expression = "^(0)$"
+				replace    = "info"
+			}
+
+			stage.replace {
+				source     = "level_raw"
+				expression = "^([0-9]+)$"
+				replace    = "debug"
+			}
+
+			stage.labels {
+				values = {
+					level = "level_raw",
+				}
+			}
+		}
+
+		// Rook operator (capnslog):
+		//   2026-10-03 06:12:01.123456 I | op-osd: ...
+		stage.match {
+			selector = "{level=\"unknown\"} |~ \"^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:.]+ [CEWNIDT] \\\\| \""
+
+			stage.regex {
+				expression = `^\S+ \S+ (?P<level_raw>[CEWNIDT]) \| `
+			}
+
+			stage.replace {
+				source     = "level_raw"
+				expression = "^(C)$"
+				replace    = "critical"
+			}
+
+			stage.replace {
+				source     = "level_raw"
+				expression = "^(E)$"
+				replace    = "error"
+			}
+
+			stage.replace {
+				source     = "level_raw"
+				expression = "^(W)$"
+				replace    = "warn"
+			}
+
+			stage.replace {
+				source     = "level_raw"
+				expression = "^(N|I)$"
+				replace    = "info"
+			}
+
+			stage.replace {
+				source     = "level_raw"
+				expression = "^(D|T)$"
+				replace    = "debug"
+			}
+
+			stage.labels {
+				values = {
+					level = "level_raw",
+				}
+			}
+		}
+
+		// Adding a label as structured metadata removes it from the stream
+		// labels.
+		stage.structured_metadata {
+			values = {
+				ceph_fsid = "",
+			}
+		}
+	}
+}

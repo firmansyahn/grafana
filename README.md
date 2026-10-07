@@ -61,8 +61,9 @@ The modules are written for and checked against Alloy v1.19.2.
 | `k8s_pod_logs` | `kubernetes` | Pod logs through the API server, with fixed health-check drops and redactions | `forward_to` |
 | `k8s_podlogs` | `kubernetes` | Logs of the local node's pods that PodLogs resources select, streamed through the API server, limited to a tenant's namespaces | `forward_to` |
 | `k8s_events` | `kubernetes` | Kubernetes events as log lines: Warnings, plus node condition changes, by default | `forward_to` |
-| `k8s_alert` | `metrics`, `metrics_scoped`, `logs` | Syncs PrometheusRule CRDs into the Mimir ruler (PromQL) and the Loki ruler (LogQL) | The rulers' APIs |
+| `k8s_alerts` | `metrics`, `metrics_scoped`, `logs` | Syncs PrometheusRule CRDs into the Mimir ruler (PromQL) and the Loki ruler (LogQL) | The rulers' APIs |
 | `k8s_otel` | `default`, `tenant_route` | An OTLP gateway on ports 4317 and 4318 that adds Kubernetes attributes, and per-tenant routes with service graph and span metrics | OTLP exporters and remote_write |
+| `ceph_logs` | `process` | A `loki.process` for Ceph and Rook pod logs, chained after `k8s_podlogs`: drops the lines Ceph's metrics already cover and reads the Ceph and Rook log levels | `forward_to` |
 | `openebs_logs` | `log` | A `loki.process` that joins OpenEBS's multi-line log records | `forward_to` |
 
 ### Databases
@@ -93,7 +94,7 @@ The modules are written for and checked against Alloy v1.19.2.
 | [`rules/postgres-metrics.yaml`](rules/postgres-metrics.yaml) | Patroni, etcd, HAProxy, PgBouncer and PostgreSQL, as `postgres_metrics` collects them |
 | [`rules/mongodb-metrics.yaml`](rules/mongodb-metrics.yaml) | MongoDB processes, replica sets and sharding, as `mongodb_metrics` collects them |
 
-Both are Prometheus Operator `PrometheusRule`s. In a namespace that `k8s_alert.metrics` watches, they are synced into that tenant's Mimir ruler. Without Kubernetes, load the groups with mimirtool:
+Both are Prometheus Operator `PrometheusRule`s. In a namespace that `k8s_alerts.metrics` watches, they are synced into that tenant's Mimir ruler. Without Kubernetes, load the groups with mimirtool:
 
 ```sh
 yq '{"namespace": .metadata.name, "groups": .spec.groups}' \
