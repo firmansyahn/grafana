@@ -62,7 +62,7 @@ The modules are written for and checked against Alloy v1.19.2.
 | `k8s_podlogs` | `kubernetes` | Logs of the local node's pods that PodLogs resources select, streamed through the API server, limited to a tenant's namespaces | `forward_to` |
 | `k8s_events` | `kubernetes` | Kubernetes events as log lines: Warnings, plus node condition changes, by default | `forward_to` |
 | `k8s_alerts` | `metrics`, `metrics_scoped`, `logs` | Syncs PrometheusRule CRDs into the Mimir ruler (PromQL) and the Loki ruler (LogQL) | The rulers' APIs |
-| `k8s_otel` | `default`, `tenant_route` | An OTLP gateway on ports 4317 and 4318 that adds Kubernetes attributes, and per-tenant routes with service graph and span metrics | OTLP exporters and remote_write |
+| `k8s_otel` | `default`, `tenant_route` | An OTLP gateway on ports 4317 and 4318 that adds Kubernetes attributes, and per-tenant routes with service graph and span metrics | OTLP exporters, and remote_write or `metrics_forward_to` |
 | `ceph_logs` | `process` | A `loki.process` for Ceph and Rook pod logs, chained after `k8s_podlogs`: drops the lines Ceph's metrics already cover and reads the Ceph and Rook log levels | `forward_to` |
 | `openebs_logs` | `log` | A `loki.process` that joins OpenEBS's multi-line log records | `forward_to` |
 
