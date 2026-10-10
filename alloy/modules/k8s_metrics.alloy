@@ -113,6 +113,43 @@ declare "kubernetes" {
 		default  = ""
 	}
 
+	// -- Embedded remote_write queue and WAL --------------------------------
+	// Defaults are tuned below Alloy's own, which size every instance for a
+	// load it never sees: one queue shard covers normal load, and Mimir
+	// rejects samples older than its out-of-order window anyway, so holding
+	// hours of backlog only costs memory and disk. The trade-off: after an
+	// outage longer than an hour the unsent backlog older than that is dropped
+	// rather than replayed. Not used when forward_to is set.
+	argument "queue_max_shards" {
+		comment  = "Maximum concurrent queue shards sending to the endpoint (default: 10; Alloy's own is 50)"
+		optional = true
+		default  = 10
+	}
+
+	argument "queue_capacity" {
+		comment  = "Samples buffered per shard (default: 2500; Alloy's own is 10000)"
+		optional = true
+		default  = 2500
+	}
+
+	argument "queue_sample_age_limit" {
+		comment  = "Drop samples older than this instead of sending them (default: \"1h\"; \"0s\" disables it, Alloy's own default)"
+		optional = true
+		default  = "1h"
+	}
+
+	argument "wal_truncate_frequency" {
+		comment  = "How often the WAL is truncated (default: \"30m\"; Alloy's own is \"2h\")"
+		optional = true
+		default  = "30m"
+	}
+
+	argument "wal_max_keepalive_time" {
+		comment  = "Longest unsent data is kept in the WAL before it is dropped (default: \"1h\"; Alloy's own is \"8h\")"
+		optional = true
+		default  = "1h"
+	}
+
 	// -- Optional -----------------------------------------------------------
 	argument "project_label" {
 		comment  = "Pod meta-label to map to a project_name label, e.g. \"__meta_kubernetes_pod_label_app_kubernetes_io_part_of\". Empty disables it (default: \"\")"
@@ -268,12 +305,23 @@ declare "kubernetes" {
 			headers = {
 				"X-Scope-OrgID" = argument.tenant_id.value,
 			}
+
+			queue_config {
+				max_shards       = argument.queue_max_shards.value
+				capacity         = argument.queue_capacity.value
+				sample_age_limit = argument.queue_sample_age_limit.value
+			}
 		}
 
 		external_labels = {
 			region       = coalesce(argument.region.value, ""),
 			zone         = coalesce(argument.zone.value, ""),
 			cluster_name = coalesce(argument.cluster_name.value, ""),
+		}
+
+		wal {
+			truncate_frequency = argument.wal_truncate_frequency.value
+			max_keepalive_time = argument.wal_max_keepalive_time.value
 		}
 	}
 }
@@ -373,6 +421,43 @@ declare "crds" {
 		default  = ""
 	}
 
+	// -- Embedded remote_write queue and WAL --------------------------------
+	// Defaults are tuned below Alloy's own, which size every instance for a
+	// load it never sees: one queue shard covers normal load, and Mimir
+	// rejects samples older than its out-of-order window anyway, so holding
+	// hours of backlog only costs memory and disk. The trade-off: after an
+	// outage longer than an hour the unsent backlog older than that is dropped
+	// rather than replayed. Not used when forward_to is set.
+	argument "queue_max_shards" {
+		comment  = "Maximum concurrent queue shards sending to the endpoint (default: 10; Alloy's own is 50)"
+		optional = true
+		default  = 10
+	}
+
+	argument "queue_capacity" {
+		comment  = "Samples buffered per shard (default: 2500; Alloy's own is 10000)"
+		optional = true
+		default  = 2500
+	}
+
+	argument "queue_sample_age_limit" {
+		comment  = "Drop samples older than this instead of sending them (default: \"1h\"; \"0s\" disables it, Alloy's own default)"
+		optional = true
+		default  = "1h"
+	}
+
+	argument "wal_truncate_frequency" {
+		comment  = "How often the WAL is truncated (default: \"30m\"; Alloy's own is \"2h\")"
+		optional = true
+		default  = "30m"
+	}
+
+	argument "wal_max_keepalive_time" {
+		comment  = "Longest unsent data is kept in the WAL before it is dropped (default: \"1h\"; Alloy's own is \"8h\")"
+		optional = true
+		default  = "1h"
+	}
+
 	// -- Optional -----------------------------------------------------------
 	// No project_label here: it is applied by the annotated-pod relabel rules,
 	// which this declare does not run. CRD targets carry whatever labels the
@@ -439,12 +524,23 @@ declare "crds" {
 			headers = {
 				"X-Scope-OrgID" = argument.tenant_id.value,
 			}
+
+			queue_config {
+				max_shards       = argument.queue_max_shards.value
+				capacity         = argument.queue_capacity.value
+				sample_age_limit = argument.queue_sample_age_limit.value
+			}
 		}
 
 		external_labels = {
 			region       = coalesce(argument.region.value, ""),
 			zone         = coalesce(argument.zone.value, ""),
 			cluster_name = coalesce(argument.cluster_name.value, ""),
+		}
+
+		wal {
+			truncate_frequency = argument.wal_truncate_frequency.value
+			max_keepalive_time = argument.wal_max_keepalive_time.value
 		}
 	}
 }
@@ -487,6 +583,43 @@ declare "annotations" {
 		comment  = "Basic-auth password for the embedded remote_write (default: \"\", no credentials)"
 		optional = true
 		default  = ""
+	}
+
+	// -- Embedded remote_write queue and WAL --------------------------------
+	// Defaults are tuned below Alloy's own, which size every instance for a
+	// load it never sees: one queue shard covers normal load, and Mimir
+	// rejects samples older than its out-of-order window anyway, so holding
+	// hours of backlog only costs memory and disk. The trade-off: after an
+	// outage longer than an hour the unsent backlog older than that is dropped
+	// rather than replayed. Not used when forward_to is set.
+	argument "queue_max_shards" {
+		comment  = "Maximum concurrent queue shards sending to the endpoint (default: 10; Alloy's own is 50)"
+		optional = true
+		default  = 10
+	}
+
+	argument "queue_capacity" {
+		comment  = "Samples buffered per shard (default: 2500; Alloy's own is 10000)"
+		optional = true
+		default  = 2500
+	}
+
+	argument "queue_sample_age_limit" {
+		comment  = "Drop samples older than this instead of sending them (default: \"1h\"; \"0s\" disables it, Alloy's own default)"
+		optional = true
+		default  = "1h"
+	}
+
+	argument "wal_truncate_frequency" {
+		comment  = "How often the WAL is truncated (default: \"30m\"; Alloy's own is \"2h\")"
+		optional = true
+		default  = "30m"
+	}
+
+	argument "wal_max_keepalive_time" {
+		comment  = "Longest unsent data is kept in the WAL before it is dropped (default: \"1h\"; Alloy's own is \"8h\")"
+		optional = true
+		default  = "1h"
 	}
 
 	// -- Optional -----------------------------------------------------------
@@ -615,12 +748,23 @@ declare "annotations" {
 			headers = {
 				"X-Scope-OrgID" = argument.tenant_id.value,
 			}
+
+			queue_config {
+				max_shards       = argument.queue_max_shards.value
+				capacity         = argument.queue_capacity.value
+				sample_age_limit = argument.queue_sample_age_limit.value
+			}
 		}
 
 		external_labels = {
 			region       = coalesce(argument.region.value, ""),
 			zone         = coalesce(argument.zone.value, ""),
 			cluster_name = coalesce(argument.cluster_name.value, ""),
+		}
+
+		wal {
+			truncate_frequency = argument.wal_truncate_frequency.value
+			max_keepalive_time = argument.wal_max_keepalive_time.value
 		}
 	}
 }
