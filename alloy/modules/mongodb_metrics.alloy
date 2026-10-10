@@ -67,9 +67,10 @@
 //
 // Delivery -- as in postgres_metrics, every declare takes either the embedded
 // remote_write (tenant_id, endpoint_url, endpoint_basic_auth_*) or forward_to,
-// mutually exclusive. The declares on one host share one remote_write by
-// giving one of them the endpoint and pointing the others' forward_to at its
-// exported receiver. External labels (region, zone, cluster_name or
+// mutually exclusive. forward_to can point at a prometheus.remote_write
+// defined outside the module. The declares on one host share one remote_write
+// by giving one of them the endpoint and pointing the others' forward_to at
+// its exported receiver. External labels (region, zone, cluster_name or
 // external_labels) apply at whichever remote_write the series reach.
 //
 // Verified on a three-node sharded cluster (MongoDB 8.2, one shard, TLS with
@@ -99,6 +100,12 @@
 //   mongodb://alloy_monitor:<password>@127.0.0.1:27017/admin
 // (URL-encode the password with encoding.url_encode if it has special
 // characters).
+//
+// Usage (forwarding to a remote_write defined outside the module):
+//   mongodb_metrics.mongodb "mongod" {
+//       mongodb_uri = sys.env("MONGODB_MONITOR_URI")
+//       forward_to  = [prometheus.remote_write.mimir.receiver]
+//   }
 
 // mongodb_metrics.mongodb
 //
@@ -139,7 +146,7 @@ declare "mongodb" {
 	// -- Delivery: embedded remote_write, or forward_to ---------------------
 	// An explicit [] coalesces to the default -- pass a real receiver, or omit.
 	argument "forward_to" {
-		comment  = "list(MetricsReceiver) to send metrics to INSTEAD of the embedded remote_write: another declare's exported receiver, to share one remote_write, or your own prometheus.relabel (default: unset, use the embedded remote_write)"
+		comment  = "list(MetricsReceiver) to send metrics to INSTEAD of the embedded remote_write: a prometheus.remote_write defined outside the module, another declare's exported receiver, to share one remote_write, or your own prometheus.relabel (default: unset, use the embedded remote_write)"
 		optional = true
 	}
 

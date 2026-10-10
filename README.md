@@ -42,10 +42,10 @@ The modules are written for and checked against Alloy v1.19.2.
 
 | Module | Declares | Collects | Delivery |
 |---|---|---|---|
-| `host_metrics` | `unix` | Host metrics through the embedded node_exporter | Built-in remote_write |
-| | `kubelet` | The local kubelet's `/metrics`, `/metrics/cadvisor`, `/metrics/probes` and `/metrics/resource` | Built-in remote_write |
-| | `control_plane` | The local kube-controller-manager, kube-scheduler and etcd | Built-in remote_write |
-| | `containers` | CPU, memory, block I/O and pids of every Docker or Podman container, from cgroups through cAdvisor | Built-in remote_write |
+| `host_metrics` | `unix` | Host metrics through the embedded node_exporter | Built-in remote_write or `forward_to` |
+| | `kubelet` | The local kubelet's `/metrics`, `/metrics/cadvisor`, `/metrics/probes` and `/metrics/resource` | Built-in remote_write or `forward_to` |
+| | `control_plane` | The local kube-controller-manager, kube-scheduler and etcd | Built-in remote_write or `forward_to` |
+| | `containers` | CPU, memory, block I/O and pids of every Docker or Podman container, from cgroups through cAdvisor | Built-in remote_write or `forward_to` |
 | `host_logs` | `journal`, `files`, `syslog` | The systemd journal, text files under `/var/log`, and syslog received over the network | Built-in loki.write or `forward_to` |
 | `container_metrics` | `apps` | Metrics that apps inside Docker or Podman containers expose, from containers that opt in with labels | Built-in remote_write |
 
@@ -53,9 +53,9 @@ The modules are written for and checked against Alloy v1.19.2.
 
 | Module | Declares | Collects | Delivery |
 |---|---|---|---|
-| `k8s_metrics` | `kubernetes` | Annotated pods (`prometheus.io/scrape`) and ServiceMonitors in a tenant's namespaces | Built-in remote_write |
-| | `crds` | ServiceMonitors and PodMonitors only | Built-in remote_write |
-| | `annotations` | Annotated pods only | Built-in remote_write |
+| `k8s_metrics` | `kubernetes` | Annotated pods (`prometheus.io/scrape`) and ServiceMonitors in a tenant's namespaces | Built-in remote_write or `forward_to` |
+| | `crds` | ServiceMonitors and PodMonitors only | Built-in remote_write or `forward_to` |
+| | `annotations` | Annotated pods only | Built-in remote_write or `forward_to` |
 | `k8s_pod_logs_file` | `kubernetes` | Pod logs tailed from `/var/log/pods` on the local node | `forward_to` |
 | `k8s_pod_logs_api` | `kubernetes` | Pod logs of the local node's pods, streamed through the API server | `forward_to` |
 | `k8s_pod_logs` | `kubernetes` | Pod logs through the API server, with fixed health-check drops and redactions | `forward_to` |
@@ -77,7 +77,7 @@ The modules are written for and checked against Alloy v1.19.2.
 
 | Module | Declares | Collects | Delivery |
 |---|---|---|---|
-| `self_monitor` | `default` | Alloy's own metrics, logs and traces | Built-in remote_write, loki.write and OTLP exporter |
+| `self_monitor` | `default` | Alloy's own metrics, logs and traces | Built-in remote_write, loki.write and OTLP exporter, or per-signal `*_forward_to` |
 
 ## Conventions
 
