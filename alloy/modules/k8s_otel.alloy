@@ -329,6 +329,45 @@ declare "tenant_route" {
 		default  = "http://localhost:9009/api/v1/push"
 	}
 
+	// -- Embedded remote_write queue and WAL --------------------------------
+	// Same arguments and defaults as k8s_metrics. Under a DaemonSet there is
+	// one of these remote_writes per node per tenant, each carrying only a
+	// trickle -- spanmetrics and servicegraph flush every 15s -- so Alloy's own
+	// defaults (50 shards of 10000 samples, 8h of WAL) mostly reserve memory
+	// and disk. Mimir rejects samples older than its out-of-order window
+	// anyway. The trade-off: after an outage longer than an hour the unsent
+	// backlog older than that is dropped rather than replayed. Not used when
+	// metrics_forward_to is set.
+	argument "queue_max_shards" {
+		comment  = "Maximum concurrent queue shards sending to the metrics endpoint (default: 10; Alloy's own is 50)"
+		optional = true
+		default  = 10
+	}
+
+	argument "queue_capacity" {
+		comment  = "Samples buffered per shard (default: 2500; Alloy's own is 10000)"
+		optional = true
+		default  = 2500
+	}
+
+	argument "queue_sample_age_limit" {
+		comment  = "Drop samples older than this instead of sending them (default: \"1h\"; \"0s\" disables it, Alloy's own default)"
+		optional = true
+		default  = "1h"
+	}
+
+	argument "wal_truncate_frequency" {
+		comment  = "How often the WAL is truncated (default: \"30m\"; Alloy's own is \"2h\")"
+		optional = true
+		default  = "30m"
+	}
+
+	argument "wal_max_keepalive_time" {
+		comment  = "Longest unsent data is kept in the WAL before it is dropped (default: \"1h\"; Alloy's own is \"8h\")"
+		optional = true
+		default  = "1h"
+	}
+
 	// -- Optional -----------------------------------------------------------
 	argument "region" {
 		comment  = "Value for the region external label on this tenant's metrics (default: \"\", unset)"
@@ -605,12 +644,23 @@ declare "tenant_route" {
 			headers = {
 				"X-Scope-OrgID" = argument.tenant_id.value,
 			}
+
+			queue_config {
+				max_shards       = argument.queue_max_shards.value
+				capacity         = argument.queue_capacity.value
+				sample_age_limit = argument.queue_sample_age_limit.value
+			}
 		}
 
 		external_labels = {
 			region       = coalesce(argument.region.value, ""),
 			zone         = coalesce(argument.zone.value, ""),
 			cluster_name = coalesce(argument.cluster_name.value, ""),
+		}
+
+		wal {
+			truncate_frequency = argument.wal_truncate_frequency.value
+			max_keepalive_time = argument.wal_max_keepalive_time.value
 		}
 	}
 }
