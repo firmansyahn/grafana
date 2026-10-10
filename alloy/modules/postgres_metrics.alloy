@@ -44,13 +44,14 @@
 //   - Default: the embedded prometheus.remote_write, configured with tenant_id,
 //     endpoint_url and endpoint_basic_auth_*, exactly like host_metrics.
 //   - forward_to: send to any list(MetricsReceiver) instead; the embedded writer
-//     is then never fed. This is how the declares on one host share ONE
+//     is then never fed. This is how metrics go to a prometheus.remote_write
+//     defined outside the module, how the declares on one host share ONE
 //     remote_write -- give one of them the endpoint, and point the others'
 //     forward_to at its exported receiver -- and how site-specific relabeling
 //     is injected: your own prometheus.relabel, forwarding on to that receiver.
 //     External labels (region, zone, cluster_name or external_labels) are
 //     applied by whichever remote_write the series finally reach, so set them
-//     on that one declare.
+//     on that one declare, or on your own remote_write.
 //
 // Verified end to end on a three-node Patroni 4.1 / PostgreSQL 18 cluster on
 // Docker, with etcd 3.6 (client mTLS), HAProxy 3.3 and PgBouncer 1.25, on a
@@ -79,6 +80,18 @@
 //   }
 //   postgres_metrics.pgbouncer "db" {
 //       forward_to = [postgres_metrics.postgres.db.receiver]
+//   }
+//
+// Usage (forwarding to a remote_write defined outside the module):
+//   prometheus.remote_write "mimir" {
+//       endpoint {
+//           url     = sys.env("MIMIR_ENDPOINT_URL")
+//           headers = { "X-Scope-OrgID" = "my-tenant" }
+//       }
+//   }
+//   postgres_metrics.postgres "db" {
+//       data_source_names = [sys.env("POSTGRES_MONITOR_DSN")]
+//       forward_to        = [prometheus.remote_write.mimir.receiver]
 //   }
 
 // postgres_metrics.postgres
@@ -157,7 +170,7 @@ declare "postgres" {
 	// -- Delivery: embedded remote_write, or forward_to ---------------------
 	// An explicit [] coalesces to the default -- pass a real receiver, or omit.
 	argument "forward_to" {
-		comment  = "list(MetricsReceiver) to send metrics to INSTEAD of the embedded remote_write: another declare's exported receiver, to share one remote_write, or your own prometheus.relabel (default: unset, use the embedded remote_write)"
+		comment  = "list(MetricsReceiver) to send metrics to INSTEAD of the embedded remote_write: a prometheus.remote_write defined outside the module, another declare's exported receiver, to share one remote_write, or your own prometheus.relabel (default: unset, use the embedded remote_write)"
 		optional = true
 	}
 
@@ -361,7 +374,7 @@ declare "postgres" {
 declare "patroni" {
 	// -- Delivery: embedded remote_write, or forward_to ---------------------
 	argument "forward_to" {
-		comment  = "list(MetricsReceiver) to send metrics to INSTEAD of the embedded remote_write: another declare's exported receiver, to share one remote_write, or your own prometheus.relabel (default: unset, use the embedded remote_write)"
+		comment  = "list(MetricsReceiver) to send metrics to INSTEAD of the embedded remote_write: a prometheus.remote_write defined outside the module, another declare's exported receiver, to share one remote_write, or your own prometheus.relabel (default: unset, use the embedded remote_write)"
 		optional = true
 	}
 
@@ -594,7 +607,7 @@ declare "patroni" {
 declare "etcd" {
 	// -- Delivery: embedded remote_write, or forward_to ---------------------
 	argument "forward_to" {
-		comment  = "list(MetricsReceiver) to send metrics to INSTEAD of the embedded remote_write: another declare's exported receiver, to share one remote_write, or your own prometheus.relabel (default: unset, use the embedded remote_write)"
+		comment  = "list(MetricsReceiver) to send metrics to INSTEAD of the embedded remote_write: a prometheus.remote_write defined outside the module, another declare's exported receiver, to share one remote_write, or your own prometheus.relabel (default: unset, use the embedded remote_write)"
 		optional = true
 	}
 
@@ -805,7 +818,7 @@ declare "etcd" {
 declare "haproxy" {
 	// -- Delivery: embedded remote_write, or forward_to ---------------------
 	argument "forward_to" {
-		comment  = "list(MetricsReceiver) to send metrics to INSTEAD of the embedded remote_write: another declare's exported receiver, to share one remote_write, or your own prometheus.relabel (default: unset, use the embedded remote_write)"
+		comment  = "list(MetricsReceiver) to send metrics to INSTEAD of the embedded remote_write: a prometheus.remote_write defined outside the module, another declare's exported receiver, to share one remote_write, or your own prometheus.relabel (default: unset, use the embedded remote_write)"
 		optional = true
 	}
 
@@ -1026,7 +1039,7 @@ declare "haproxy" {
 declare "pgbouncer" {
 	// -- Delivery: embedded remote_write, or forward_to ---------------------
 	argument "forward_to" {
-		comment  = "list(MetricsReceiver) to send metrics to INSTEAD of the embedded remote_write: another declare's exported receiver, to share one remote_write, or your own prometheus.relabel (default: unset, use the embedded remote_write)"
+		comment  = "list(MetricsReceiver) to send metrics to INSTEAD of the embedded remote_write: a prometheus.remote_write defined outside the module, another declare's exported receiver, to share one remote_write, or your own prometheus.relabel (default: unset, use the embedded remote_write)"
 		optional = true
 	}
 

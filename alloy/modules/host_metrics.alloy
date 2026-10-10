@@ -16,7 +16,8 @@
 //   - Self-contained per-node collector (host root/proc/sys via mounts).
 //   - Stamps instance and node labels from the local node name.
 //   - Stamps region / zone / cluster_name external labels.
-//   - Embedded remote_write so the tenant (X-Scope-OrgID) is set per instance.
+//   - Embedded remote_write so the tenant (X-Scope-OrgID) is set per instance,
+//     or forward_to to send to a remote_write of your own instead.
 //   - Skips Docker, Podman and containerd per-container mounts, so container
 //     churn does not churn node_filesystem_* series.
 //
@@ -37,6 +38,19 @@
 //     Podman (verified); pass node_name if you cannot use host networking.
 //     See the containers declare below for a full run command.
 //
+// Delivery -- every declare in this file supports both, and they are mutually
+// exclusive, as in postgres_metrics:
+//   - Default: the embedded prometheus.remote_write, configured with tenant_id,
+//     endpoint_url and endpoint_basic_auth_*.
+//   - forward_to: send to any list(MetricsReceiver) instead -- a
+//     prometheus.remote_write defined outside the module, another declare's
+//     exported receiver (so the declares on one host share ONE remote_write),
+//     or your own prometheus.relabel for site-specific rules. The embedded
+//     writer is then never fed, and tenant_id and endpoint_* can be left out.
+//     External labels (region, zone, cluster_name or external_labels) are
+//     applied by whichever remote_write the series finally reach, so with an
+//     outside remote_write set them there.
+//
 // Usage:
 //   host_metrics.unix "node" {
 //       tenant_id                    = "my-tenant"
@@ -47,22 +61,50 @@
 //       zone                         = sys.env("ZONE")
 //       cluster_name                 = sys.env("CLUSTER_NAME")
 //   }
+//
+// Usage (forwarding to a remote_write defined outside the module):
+//   prometheus.remote_write "mimir" {
+//       endpoint {
+//           url     = sys.env("MIMIR_ENDPOINT_URL")
+//           headers = { "X-Scope-OrgID" = "my-tenant" }
+//       }
+//       external_labels = { cluster_name = sys.env("CLUSTER_NAME") }
+//   }
+//   host_metrics.unix "node" {
+//       forward_to = [prometheus.remote_write.mimir.receiver]
+//   }
 declare "unix" {
-	// -- Required -----------------------------------------------------------
+	// -- Delivery: embedded remote_write, or forward_to ---------------------
+	// An explicit [] coalesces to the default -- pass a real receiver, or omit.
+	argument "forward_to" {
+		comment  = "list(MetricsReceiver) to send node metrics to INSTEAD of the embedded remote_write: a prometheus.remote_write defined outside the module, another declare's exported receiver, or your own prometheus.relabel (default: unset, use the embedded remote_write)"
+		optional = true
+	}
+
 	argument "tenant_id" {
-		comment = "The tenant (X-Scope-OrgID) to write node metrics to"
+		comment  = "The tenant (X-Scope-OrgID) for the embedded remote_write. Required unless forward_to is set."
+		optional = true
+		default  = ""
 	}
 
 	argument "endpoint_url" {
-		comment = "Prometheus-compatible remote_write URL (e.g. Mimir)"
+		comment  = "Prometheus-compatible remote_write URL (e.g. Mimir) for the embedded writer. Required unless forward_to is set; the default points at a local Mimir so a misconfiguration fails loudly with connection errors rather than silently discarding metrics."
+		optional = true
+		default  = "http://localhost:9009/api/v1/push"
 	}
-
+	// Alloy has no conditional blocks, so basic_auth is always present on the
+	// embedded endpoint. Left empty it sends an empty Basic header, which an
+	// endpoint without authentication ignores.
 	argument "endpoint_basic_auth_username" {
-		comment = "Basic-auth username for the remote_write endpoint"
+		comment  = "Basic-auth username for the embedded remote_write (default: \"\", no credentials)"
+		optional = true
+		default  = ""
 	}
 
 	argument "endpoint_basic_auth_password" {
-		comment = "Basic-auth password for the remote_write endpoint"
+		comment  = "Basic-auth password for the embedded remote_write (default: \"\", no credentials)"
+		optional = true
+		default  = ""
 	}
 
 	// -- Optional -----------------------------------------------------------
@@ -98,12 +140,10 @@ declare "unix" {
 		comment  = "Complete external_labels map for the embedded remote_write, REPLACING the region/zone/cluster_name defaults (default: unset, which keeps them). Use it to carry site-specific labels such as environment or role."
 		optional = true
 	}
-	// Alloy cannot pass relabel rule{} blocks as a value, so custom relabeling is
-	// injected by receiver: point this at your own prometheus.relabel, which then
-	// forwards back to this module's exported .receiver (the embedded remote_write).
-	// An explicit [] coalesces to the default -- pass a real receiver, or omit.
+	// Deprecated: forward_to does the same and wins when both are set. Kept so
+	// configs written against it keep working.
 	argument "extra_relabel_to" {
-		comment  = "Optional list(MetricsReceiver) to forward node metrics to INSTEAD of the embedded remote_write -- typically your own prometheus.relabel for site-specific rules, which forwards back to this module's exported .receiver (default: the embedded remote_write)."
+		comment  = "Deprecated alias of forward_to, used only when forward_to is unset."
 		optional = true
 	}
 
@@ -215,10 +255,10 @@ declare "unix" {
 	// resolves to constants.hostname -- the same value uname already reports -- so
 	// it is a no-op on standalone VMs and Docker/Podman hosts.
 	prometheus.relabel "node" {
-		// Caller's chain if extra_relabel_to is set, else straight to remote_write.
+		// Caller's receivers if forward_to is set, else the embedded remote_write.
 		// The nodename rule below always runs first, so custom rules see the
 		// normalized value.
-		forward_to = coalesce(argument.extra_relabel_to.value, [prometheus.remote_write.default.receiver])
+		forward_to = coalesce(argument.forward_to.value, argument.extra_relabel_to.value, [prometheus.remote_write.default.receiver])
 
 		rule {
 			source_labels = ["nodename"]
@@ -228,8 +268,9 @@ declare "unix" {
 		}
 	}
 
-	// Exposed so a caller passing extra_relabel_to can forward its own
-	// prometheus.relabel back into this module's tenant-configured remote_write.
+	// Exposed so the other declares on this host can share this one's
+	// tenant-configured remote_write through their forward_to, and so a
+	// prometheus.relabel passed as forward_to can forward back into it.
 	export "receiver" {
 		value = prometheus.remote_write.default.receiver
 	}
@@ -295,22 +336,41 @@ declare "unix" {
 //       zone                         = sys.env("ZONE")
 //       cluster_name                 = sys.env("K8S_CLUSTER_NAME")
 //   }
+//
+// Usage (sharing the unix declare's remote_write):
+//   host_metrics.kubelet "kubelet" {
+//       forward_to = [host_metrics.unix.node.receiver]
+//   }
 declare "kubelet" {
-	// -- Required -----------------------------------------------------------
+	// -- Delivery: embedded remote_write, or forward_to ---------------------
+	// An explicit [] coalesces to the default -- pass a real receiver, or omit.
+	argument "forward_to" {
+		comment  = "list(MetricsReceiver) to send kubelet metrics to INSTEAD of the embedded remote_write: a prometheus.remote_write defined outside the module, another declare's exported receiver, or your own prometheus.relabel (default: unset, use the embedded remote_write)"
+		optional = true
+	}
+
 	argument "tenant_id" {
-		comment = "The tenant (X-Scope-OrgID) to write kubelet metrics to"
+		comment  = "The tenant (X-Scope-OrgID) for the embedded remote_write. Required unless forward_to is set."
+		optional = true
+		default  = ""
 	}
 
 	argument "endpoint_url" {
-		comment = "Prometheus-compatible remote_write URL (e.g. Mimir)"
+		comment  = "Prometheus-compatible remote_write URL (e.g. Mimir) for the embedded writer. Required unless forward_to is set; the default points at a local Mimir so a misconfiguration fails loudly with connection errors rather than silently discarding metrics."
+		optional = true
+		default  = "http://localhost:9009/api/v1/push"
 	}
 
 	argument "endpoint_basic_auth_username" {
-		comment = "Basic-auth username for the remote_write endpoint"
+		comment  = "Basic-auth username for the embedded remote_write (default: \"\", no credentials)"
+		optional = true
+		default  = ""
 	}
 
 	argument "endpoint_basic_auth_password" {
-		comment = "Basic-auth password for the remote_write endpoint"
+		comment  = "Basic-auth password for the embedded remote_write (default: \"\", no credentials)"
+		optional = true
+		default  = ""
 	}
 
 	// -- Optional -----------------------------------------------------------
@@ -413,7 +473,7 @@ declare "kubelet" {
 
 	prometheus.scrape "kubelet" {
 		targets    = discovery.relabel.kubelet.output
-		forward_to = [prometheus.remote_write.default.receiver]
+		forward_to = coalesce(argument.forward_to.value, [prometheus.remote_write.default.receiver])
 
 		job_name     = "kubelet"
 		metrics_path = "/metrics"
@@ -441,7 +501,7 @@ declare "kubelet" {
 
 	prometheus.scrape "cadvisor" {
 		targets    = discovery.relabel.cadvisor.output
-		forward_to = [prometheus.remote_write.default.receiver]
+		forward_to = coalesce(argument.forward_to.value, [prometheus.remote_write.default.receiver])
 
 		job_name     = "kubelet"
 		metrics_path = "/metrics/cadvisor"
@@ -465,7 +525,7 @@ declare "kubelet" {
 
 	prometheus.scrape "probes" {
 		targets    = discovery.relabel.probes.output
-		forward_to = [prometheus.remote_write.default.receiver]
+		forward_to = coalesce(argument.forward_to.value, [prometheus.remote_write.default.receiver])
 
 		job_name     = "kubelet"
 		metrics_path = "/metrics/probes"
@@ -489,7 +549,7 @@ declare "kubelet" {
 
 	prometheus.scrape "resource" {
 		targets    = discovery.relabel.resource.output
-		forward_to = [prometheus.remote_write.default.receiver]
+		forward_to = coalesce(argument.forward_to.value, [prometheus.remote_write.default.receiver])
 
 		job_name     = "kubelet"
 		metrics_path = "/metrics/resource"
@@ -509,6 +569,12 @@ declare "kubelet" {
 		clustering {
 			enabled = false
 		}
+	}
+
+	// Exposed so the other declares on this host can share this one's
+	// tenant-configured remote_write through their forward_to.
+	export "receiver" {
+		value = prometheus.remote_write.default.receiver
 	}
 
 	prometheus.remote_write "default" {
@@ -677,22 +743,41 @@ declare "kubelet" {
 //       zone                         = sys.env("ZONE")
 //       cluster_name                 = sys.env("K8S_CLUSTER_NAME")
 //   }
+//
+// Usage (sharing the unix declare's remote_write):
+//   host_metrics.control_plane "control_plane" {
+//       forward_to = [host_metrics.unix.node.receiver]
+//   }
 declare "control_plane" {
-	// -- Required -----------------------------------------------------------
+	// -- Delivery: embedded remote_write, or forward_to ---------------------
+	// An explicit [] coalesces to the default -- pass a real receiver, or omit.
+	argument "forward_to" {
+		comment  = "list(MetricsReceiver) to send control-plane metrics to INSTEAD of the embedded remote_write: a prometheus.remote_write defined outside the module, another declare's exported receiver, or your own prometheus.relabel (default: unset, use the embedded remote_write)"
+		optional = true
+	}
+
 	argument "tenant_id" {
-		comment = "The tenant (X-Scope-OrgID) to write control-plane metrics to"
+		comment  = "The tenant (X-Scope-OrgID) for the embedded remote_write. Required unless forward_to is set."
+		optional = true
+		default  = ""
 	}
 
 	argument "endpoint_url" {
-		comment = "Prometheus-compatible remote_write URL (e.g. Mimir)"
+		comment  = "Prometheus-compatible remote_write URL (e.g. Mimir) for the embedded writer. Required unless forward_to is set; the default points at a local Mimir so a misconfiguration fails loudly with connection errors rather than silently discarding metrics."
+		optional = true
+		default  = "http://localhost:9009/api/v1/push"
 	}
 
 	argument "endpoint_basic_auth_username" {
-		comment = "Basic-auth username for the remote_write endpoint"
+		comment  = "Basic-auth username for the embedded remote_write (default: \"\", no credentials)"
+		optional = true
+		default  = ""
 	}
 
 	argument "endpoint_basic_auth_password" {
-		comment = "Basic-auth password for the remote_write endpoint"
+		comment  = "Basic-auth password for the embedded remote_write (default: \"\", no credentials)"
+		optional = true
+		default  = ""
 	}
 
 	// -- Optional -----------------------------------------------------------
@@ -816,7 +901,7 @@ declare "control_plane" {
 
 	prometheus.scrape "controller_manager" {
 		targets    = discovery.relabel.controller_manager.output
-		forward_to = [prometheus.remote_write.default.receiver]
+		forward_to = coalesce(argument.forward_to.value, [prometheus.remote_write.default.receiver])
 
 		job_name = "kube-controller-manager"
 		scheme   = "https"
@@ -839,7 +924,7 @@ declare "control_plane" {
 
 	prometheus.scrape "scheduler" {
 		targets    = discovery.relabel.scheduler.output
-		forward_to = [prometheus.remote_write.default.receiver]
+		forward_to = coalesce(argument.forward_to.value, [prometheus.remote_write.default.receiver])
 
 		job_name = "kube-scheduler"
 		scheme   = "https"
@@ -866,7 +951,7 @@ declare "control_plane" {
 	// header.
 	prometheus.scrape "etcd" {
 		targets    = discovery.relabel.etcd.output
-		forward_to = [prometheus.remote_write.default.receiver]
+		forward_to = coalesce(argument.forward_to.value, [prometheus.remote_write.default.receiver])
 
 		job_name = "kube-etcd"
 		scheme   = "http"
@@ -881,6 +966,12 @@ declare "control_plane" {
 		clustering {
 			enabled = false
 		}
+	}
+
+	// Exposed so the other declares on this host can share this one's
+	// tenant-configured remote_write through their forward_to.
+	export "receiver" {
+		value = prometheus.remote_write.default.receiver
 	}
 
 	prometheus.remote_write "default" {
@@ -1015,22 +1106,42 @@ declare "control_plane" {
 //       zone                         = sys.env("ZONE")
 //       cluster_name                 = sys.env("CLUSTER_NAME")
 //   }
+//
+// Usage (forwarding to a remote_write defined outside the module):
+//   host_metrics.containers "containers" {
+//       node_name  = sys.env("NODE_NAME")
+//       forward_to = [prometheus.remote_write.mimir.receiver]
+//   }
 declare "containers" {
-	// -- Required -----------------------------------------------------------
+	// -- Delivery: embedded remote_write, or forward_to ---------------------
+	// An explicit [] coalesces to the default -- pass a real receiver, or omit.
+	argument "forward_to" {
+		comment  = "list(MetricsReceiver) to send container metrics to INSTEAD of the embedded remote_write: a prometheus.remote_write defined outside the module, another declare's exported receiver, or your own prometheus.relabel (default: unset, use the embedded remote_write)"
+		optional = true
+	}
+
 	argument "tenant_id" {
-		comment = "The tenant (X-Scope-OrgID) to write container metrics to"
+		comment  = "The tenant (X-Scope-OrgID) for the embedded remote_write. Required unless forward_to is set."
+		optional = true
+		default  = ""
 	}
 
 	argument "endpoint_url" {
-		comment = "Prometheus-compatible remote_write URL (e.g. Mimir)"
+		comment  = "Prometheus-compatible remote_write URL (e.g. Mimir) for the embedded writer. Required unless forward_to is set; the default points at a local Mimir so a misconfiguration fails loudly with connection errors rather than silently discarding metrics."
+		optional = true
+		default  = "http://localhost:9009/api/v1/push"
 	}
 
 	argument "endpoint_basic_auth_username" {
-		comment = "Basic-auth username for the remote_write endpoint"
+		comment  = "Basic-auth username for the embedded remote_write (default: \"\", no credentials)"
+		optional = true
+		default  = ""
 	}
 
 	argument "endpoint_basic_auth_password" {
-		comment = "Basic-auth password for the remote_write endpoint"
+		comment  = "Basic-auth password for the embedded remote_write (default: \"\", no credentials)"
+		optional = true
+		default  = ""
 	}
 
 	// -- Optional -----------------------------------------------------------
@@ -1077,12 +1188,9 @@ declare "containers" {
 		comment  = "Complete external_labels map for the embedded remote_write, REPLACING the region/zone/cluster_name defaults (default: unset, which keeps them). Use it to carry site-specific labels such as environment or role."
 		optional = true
 	}
-	// Alloy cannot pass relabel rule{} blocks as a value, so custom relabeling is
-	// injected by receiver: point this at your own prometheus.relabel, which then
-	// forwards back to this module's exported .receiver (the embedded remote_write).
-	// An explicit [] coalesces to the default -- pass a real receiver, or omit.
+	// Deprecated, as in unix above.
 	argument "extra_relabel_to" {
-		comment  = "Optional list(MetricsReceiver) to forward container metrics to INSTEAD of the embedded remote_write -- typically your own prometheus.relabel for site-specific rules, which forwards back to this module's exported .receiver (default: the embedded remote_write)."
+		comment  = "Deprecated alias of forward_to, used only when forward_to is unset."
 		optional = true
 	}
 
@@ -1130,17 +1238,18 @@ declare "containers" {
 		}
 	}
 
-	// Exposed so a caller passing extra_relabel_to can forward its own
-	// prometheus.relabel back into this module's tenant-configured remote_write.
+	// Exposed so the other declares on this host can share this one's
+	// tenant-configured remote_write through their forward_to, and so a
+	// prometheus.relabel passed as forward_to can forward back into it.
 	export "receiver" {
 		value = prometheus.remote_write.default.receiver
 	}
 
 	prometheus.relabel "containers" {
-		// Caller's chain if extra_relabel_to is set, else straight to remote_write.
+		// Caller's receivers if forward_to is set, else the embedded remote_write.
 		// The runtime/container_id/name rules below always run first, so custom
 		// rules see the normalized labels.
-		forward_to = coalesce(argument.extra_relabel_to.value, [prometheus.remote_write.default.receiver])
+		forward_to = coalesce(argument.forward_to.value, argument.extra_relabel_to.value, [prometheus.remote_write.default.receiver])
 
 		// Docker first, and before any rule below writes name: only the
 		// Docker handler names containers, so a name at this point means a

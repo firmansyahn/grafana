@@ -25,6 +25,21 @@
 // for the importer to wire into its `write_to` arguments. Metrics are fully
 // self-contained.
 //
+// Delivery -- per signal, embedded sink or <signal>_forward_to, mutually
+// exclusive, as in host_metrics:
+//   - Default: the embedded prometheus.remote_write, loki.write and
+//     otelcol.exporter.otlp, configured with tenant_id, the *_endpoint
+//     arguments and basic_auth_*.
+//   - metrics_forward_to / logs_forward_to / traces_forward_to: send that
+//     signal to receivers of your own instead -- e.g. a prometheus.remote_write,
+//     loki.write or otelcol exporter defined outside the module -- and its
+//     embedded sink is never fed. The signal's *_endpoint can then be left
+//     out, and tenant_id and basic_auth_* too once no embedded sink is used.
+//     The tenant comes from YOUR sink then: tenant_id is applied only by the
+//     embedded ones. Same for metrics' external labels (cluster_name, region,
+//     zone), which belong to the remote_write; on logs they are static labels
+//     set in the pipeline and survive logs_forward_to.
+//
 // Usage (the write_to references must include the instance label -- "alloy"
 // below -- since exports live on the instance, e.g.
 // self_monitor.default.alloy.logs_receiver):
@@ -42,33 +57,74 @@
 //       region              = sys.env("REGION")
 //       zone                = sys.env("ZONE")
 //   }
+//
+// Usage (every signal forwarded to sinks defined outside the module):
+//   self_monitor.default "alloy" {
+//       metrics_forward_to = [prometheus.remote_write.mimir.receiver]
+//       logs_forward_to    = [loki.write.loki.receiver]
+//       traces_forward_to  = [otelcol.exporter.otlp.tempo.input]
+//       cluster_name       = sys.env("CLUSTER_NAME")
+//   }
 declare "default" {
-	// -- Required -----------------------------------------------------------
-	// Tenant (X-Scope-OrgID) for all three sinks. Mimir via remote_write
-	// headers, Loki via loki.write.endpoint.tenant_id, Tempo via the
-	// otelcol.exporter.otlp client headers.
-	argument "tenant_id" {
-		comment = "The tenant (X-Scope-OrgID) for metrics, logs, and traces"
+	// -- Delivery: embedded sinks, or <signal>_forward_to ---------------------
+	// An explicit [] coalesces to the default -- pass a real receiver, or omit.
+	argument "metrics_forward_to" {
+		comment  = "list(MetricsReceiver) to send self-metrics to INSTEAD of the embedded remote_write, e.g. a prometheus.remote_write defined outside the module (default: unset, use the embedded remote_write)"
+		optional = true
 	}
 
+	argument "logs_forward_to" {
+		comment  = "list(LogsReceiver) to send self-logs to INSTEAD of the embedded loki.write, after this module's level filter and labels (default: unset, use the embedded loki.write)"
+		optional = true
+	}
+
+	argument "traces_forward_to" {
+		comment  = "list(otelcol.Consumer) to send batched self-traces to INSTEAD of the embedded OTLP exporter (default: unset, use the embedded exporter)"
+		optional = true
+	}
+
+	// Tenant (X-Scope-OrgID) for all three embedded sinks. Mimir via
+	// remote_write headers, Loki via loki.write.endpoint.tenant_id, Tempo via
+	// the otelcol.exporter.otlp client headers.
+	argument "tenant_id" {
+		comment  = "The tenant (X-Scope-OrgID) for the embedded metrics, logs and traces sinks. Required unless every signal is forwarded."
+		optional = true
+		default  = ""
+	}
+	// The endpoint defaults point at a local Mimir, Loki and Tempo, so a
+	// signal left with neither an endpoint nor a forward_to fails loudly with
+	// connection errors rather than silently discarding its telemetry.
 	argument "metrics_endpoint" {
-		comment = "Mimir push URL for self-metrics (e.g. https://mimir.../api/v1/push)"
+		comment  = "Mimir push URL for self-metrics (e.g. https://mimir.../api/v1/push). Required unless metrics_forward_to is set."
+		optional = true
+		default  = "http://localhost:9009/api/v1/push"
 	}
 
 	argument "logs_endpoint" {
-		comment = "Loki push URL for self-logs (e.g. https://loki.../loki/api/v1/push)"
+		comment  = "Loki push URL for self-logs (e.g. https://loki.../loki/api/v1/push). Required unless logs_forward_to is set."
+		optional = true
+		default  = "http://localhost:3100/loki/api/v1/push"
 	}
 
 	argument "traces_endpoint" {
-		comment = "OTLP gRPC endpoint for self-traces (e.g. tempo...:4317)"
+		comment  = "OTLP gRPC endpoint for self-traces (e.g. tempo...:4317). Required unless traces_forward_to is set."
+		optional = true
+		default  = "localhost:4317"
 	}
-
+	// Alloy has no conditional blocks, so basic_auth is always present on the
+	// embedded sinks. Left empty, metrics and logs send an empty Basic header
+	// and traces anonymous:anonymous (see otelcol.auth.basic below), which an
+	// endpoint without authentication ignores.
 	argument "basic_auth_username" {
-		comment = "Basic-auth username for metrics and logs endpoints"
+		comment  = "Basic-auth username for the embedded sinks (default: \"\", no credentials)"
+		optional = true
+		default  = ""
 	}
 
 	argument "basic_auth_password" {
-		comment = "Basic-auth password for metrics and logs endpoints"
+		comment  = "Basic-auth password for the embedded sinks (default: \"\", no credentials)"
+		optional = true
+		default  = ""
 	}
 
 	// -- Optional -----------------------------------------------------------
@@ -103,7 +159,7 @@ declare "default" {
 
 	prometheus.scrape "alloy" {
 		targets    = prometheus.exporter.self.alloy.targets
-		forward_to = [prometheus.remote_write.alloy.receiver]
+		forward_to = coalesce(argument.metrics_forward_to.value, [prometheus.remote_write.alloy.receiver])
 
 		clustering {
 			enabled = false
@@ -137,7 +193,7 @@ declare "default" {
 	// DaemonSet pod names contain rollout/restart suffixes, so indexing them
 	// would churn Loki streams while providing little selector value.
 	loki.process "alloy" {
-		forward_to = [loki.write.alloy.receiver]
+		forward_to = coalesce(argument.logs_forward_to.value, [loki.write.alloy.receiver])
 
 		// Level filter. The top-level `logging` block's own `level` gates
 		// stderr AND write_to together, so it cannot express "info visible in
@@ -216,7 +272,7 @@ declare "default" {
 	// header is added per-export since it identifies the tenant.
 	otelcol.processor.batch "alloy" {
 		output {
-			traces = [otelcol.exporter.otlp.alloy.input]
+			traces = coalesce(argument.traces_forward_to.value, [otelcol.exporter.otlp.alloy.input])
 		}
 	}
 
@@ -232,9 +288,14 @@ declare "default" {
 		}
 	}
 
+	// otelcol.auth.basic refuses an empty username or password ("no password
+	// provided"), which would fail the whole instance even when traces go to
+	// traces_forward_to and this exporter is never fed. With no credentials
+	// passed, the embedded exporter therefore sends anonymous:anonymous, which
+	// an endpoint without authentication ignores and one with it rejects.
 	otelcol.auth.basic "default" {
-		username = argument.basic_auth_username.value
-		password = argument.basic_auth_password.value
+		username = coalesce(argument.basic_auth_username.value, "anonymous")
+		password = coalesce(argument.basic_auth_password.value, "anonymous")
 	}
 
 	export "traces_input" {

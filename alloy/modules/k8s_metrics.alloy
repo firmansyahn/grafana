@@ -18,7 +18,8 @@
 //   - Optional project_label to promote an arbitrary pod meta-label to a
 //     project_name label (site-specific; disabled by default).
 //   - Stamps region / zone / cluster_name external labels.
-//   - Embedded remote_write so the tenant (X-Scope-OrgID) is set per instance.
+//   - Embedded remote_write so the tenant (X-Scope-OrgID) is set per instance,
+//     or forward_to to send to a remote_write of your own instead.
 //   - Discovers ServiceMonitor targets through EndpointSlices by default
 //     (kubernetes_role). The legacy Endpoints role cannot see a ServiceMonitor
 //     over a selectorless Service -- external VM targets published as a
@@ -33,6 +34,22 @@
 //     carried over from an older deployment may not, and discovery then fails
 //     for every ServiceMonitor rather than just the external ones.
 //
+// Delivery -- every declare supports both, and they are mutually exclusive, as
+// in host_metrics and postgres_metrics:
+//   - Default: the embedded prometheus.remote_write, configured with tenant_id,
+//     endpoint_url and endpoint_basic_auth_*.
+//   - forward_to: send to any list(MetricsReceiver) instead -- a
+//     prometheus.remote_write defined outside the module, another declare's
+//     exported receiver (e.g. a crds and an annotations declare for the same
+//     tenant sharing ONE remote_write), or your own prometheus.relabel. The
+//     embedded writer is then never fed, and tenant_id and endpoint_* can be
+//     left out.
+//   The tenant lives on the remote_write, not on the series: with forward_to
+//   it is whatever X-Scope-OrgID the receiving remote_write sends. Use one
+//   outside remote_write per tenant -- pointing two tenants' declares at the
+//   same one merges them into a single tenant. External labels (region, zone,
+//   cluster_name) likewise come from that remote_write.
+//
 // Usage:
 //   k8s_metrics.kubernetes "my_tenant" {
 //       namespaces                   = ["my-namespace"]
@@ -44,26 +61,93 @@
 //       zone                         = sys.env("ZONE")
 //       cluster_name                 = sys.env("K8S_CLUSTER_NAME")
 //   }
+//
+// Usage (forwarding to a remote_write defined outside the module):
+//   prometheus.remote_write "my_tenant" {
+//       endpoint {
+//           url     = sys.env("MIMIR_ENDPOINT_URL")
+//           headers = { "X-Scope-OrgID" = "my-tenant" }
+//       }
+//       external_labels = { cluster_name = sys.env("K8S_CLUSTER_NAME") }
+//   }
+//   k8s_metrics.kubernetes "my_tenant" {
+//       namespaces = ["my-namespace"]
+//       forward_to = [prometheus.remote_write.my_tenant.receiver]
+//   }
 declare "kubernetes" {
 	// -- Required -----------------------------------------------------------
 	argument "namespaces" {
 		comment = "The namespaces to look for targets in"
 	}
 
+	// -- Delivery: embedded remote_write, or forward_to ---------------------
+	// An explicit [] coalesces to the default -- pass a real receiver, or omit.
+	argument "forward_to" {
+		comment  = "list(MetricsReceiver) to send metrics to INSTEAD of the embedded remote_write: a prometheus.remote_write defined outside the module, which then sets this tenant's X-Scope-OrgID itself, another declare's exported receiver, or your own prometheus.relabel (default: unset, use the embedded remote_write)"
+		optional = true
+	}
+
 	argument "tenant_id" {
-		comment = "The tenant (X-Scope-OrgID) to write metrics to"
+		comment  = "The tenant (X-Scope-OrgID) for the embedded remote_write. Required unless forward_to is set."
+		optional = true
+		default  = ""
 	}
 
 	argument "endpoint_url" {
-		comment = "Prometheus-compatible remote_write URL (e.g. Mimir)"
+		comment  = "Prometheus-compatible remote_write URL (e.g. Mimir) for the embedded writer. Required unless forward_to is set; the default points at a local Mimir so a misconfiguration fails loudly with connection errors rather than silently discarding metrics."
+		optional = true
+		default  = "http://localhost:9009/api/v1/push"
 	}
-
+	// Alloy has no conditional blocks, so basic_auth is always present on the
+	// embedded endpoint. Left empty it sends an empty Basic header, which an
+	// endpoint without authentication ignores.
 	argument "endpoint_basic_auth_username" {
-		comment = "Basic-auth username for the remote_write endpoint"
+		comment  = "Basic-auth username for the embedded remote_write (default: \"\", no credentials)"
+		optional = true
+		default  = ""
 	}
 
 	argument "endpoint_basic_auth_password" {
-		comment = "Basic-auth password for the remote_write endpoint"
+		comment  = "Basic-auth password for the embedded remote_write (default: \"\", no credentials)"
+		optional = true
+		default  = ""
+	}
+
+	// -- Embedded remote_write queue and WAL --------------------------------
+	// Defaults are tuned below Alloy's own, which size every instance for a
+	// load it never sees: one queue shard covers normal load, and Mimir
+	// rejects samples older than its out-of-order window anyway, so holding
+	// hours of backlog only costs memory and disk. The trade-off: after an
+	// outage longer than an hour the unsent backlog older than that is dropped
+	// rather than replayed. Not used when forward_to is set.
+	argument "queue_max_shards" {
+		comment  = "Maximum concurrent queue shards sending to the endpoint (default: 10; Alloy's own is 50)"
+		optional = true
+		default  = 10
+	}
+
+	argument "queue_capacity" {
+		comment  = "Samples buffered per shard (default: 2500; Alloy's own is 10000)"
+		optional = true
+		default  = 2500
+	}
+
+	argument "queue_sample_age_limit" {
+		comment  = "Drop samples older than this instead of sending them (default: \"1h\"; \"0s\" disables it, Alloy's own default)"
+		optional = true
+		default  = "1h"
+	}
+
+	argument "wal_truncate_frequency" {
+		comment  = "How often the WAL is truncated (default: \"30m\"; Alloy's own is \"2h\")"
+		optional = true
+		default  = "30m"
+	}
+
+	argument "wal_max_keepalive_time" {
+		comment  = "Longest unsent data is kept in the WAL before it is dropped (default: \"1h\"; Alloy's own is \"8h\")"
+		optional = true
+		default  = "1h"
 	}
 
 	// -- Optional -----------------------------------------------------------
@@ -95,7 +179,7 @@ declare "kubernetes" {
 
 	// Scrape ServiceMonitor CRDs scoped to this tenant's namespaces.
 	prometheus.operator.servicemonitors "sm" {
-		forward_to      = [prometheus.remote_write.default.receiver]
+		forward_to      = coalesce(argument.forward_to.value, [prometheus.remote_write.default.receiver])
 		namespaces      = argument.namespaces.value
 		kubernetes_role = argument.kubernetes_role.value
 
@@ -107,7 +191,7 @@ declare "kubernetes" {
 
 	// Scrape Prometheus-Operator PodMonitor CRDs scoped to this tenant's namespaces.
 	prometheus.operator.podmonitors "pm" {
-		forward_to = [prometheus.remote_write.default.receiver]
+		forward_to = coalesce(argument.forward_to.value, [prometheus.remote_write.default.receiver])
 		namespaces = argument.namespaces.value
 
 		// Split PodMonitor targets across the Alloy cluster.
@@ -192,7 +276,7 @@ declare "kubernetes" {
 
 	prometheus.scrape "pods" {
 		targets    = discovery.relabel.pods.output
-		forward_to = [prometheus.remote_write.default.receiver]
+		forward_to = coalesce(argument.forward_to.value, [prometheus.remote_write.default.receiver])
 
 		scrape_interval = "30s"
 		scrape_timeout  = "10s"
@@ -201,6 +285,12 @@ declare "kubernetes" {
 		clustering {
 			enabled = true
 		}
+	}
+
+	// Exposed so other declares for the same tenant can share this one's
+	// remote_write through their forward_to.
+	export "receiver" {
+		value = prometheus.remote_write.default.receiver
 	}
 
 	prometheus.remote_write "default" {
@@ -215,12 +305,23 @@ declare "kubernetes" {
 			headers = {
 				"X-Scope-OrgID" = argument.tenant_id.value,
 			}
+
+			queue_config {
+				max_shards       = argument.queue_max_shards.value
+				capacity         = argument.queue_capacity.value
+				sample_age_limit = argument.queue_sample_age_limit.value
+			}
 		}
 
 		external_labels = {
 			region       = coalesce(argument.region.value, ""),
 			zone         = coalesce(argument.zone.value, ""),
 			cluster_name = coalesce(argument.cluster_name.value, ""),
+		}
+
+		wal {
+			truncate_frequency = argument.wal_truncate_frequency.value
+			max_keepalive_time = argument.wal_max_keepalive_time.value
 		}
 	}
 }
@@ -274,11 +375,9 @@ declare "kubernetes" {
 //       // targets.
 //   }
 //   k8s_metrics.annotations "mesh" {
-//       namespaces                   = ["istio-system", "istio-ingress"]
-//       tenant_id                    = "my-tenant"
-//       endpoint_url                 = sys.env("MIMIR_ENDPOINT_URL")
-//       endpoint_basic_auth_username = sys.env("AUTH_BASIC_USERNAME")
-//       endpoint_basic_auth_password = sys.env("AUTH_BASIC_PASSWORD")
+//       namespaces = ["istio-system", "istio-ingress"]
+//       // Same tenant as "infra": share its remote_write.
+//       forward_to = [k8s_metrics.crds.infra.receiver]
 //   }
 // ---------------------------------------------------------------------------
 
@@ -289,20 +388,74 @@ declare "crds" {
 		comment = "The namespaces to look for ServiceMonitor/PodMonitor CRDs in"
 	}
 
+	// -- Delivery: embedded remote_write, or forward_to ---------------------
+	// An explicit [] coalesces to the default -- pass a real receiver, or omit.
+	argument "forward_to" {
+		comment  = "list(MetricsReceiver) to send metrics to INSTEAD of the embedded remote_write: a prometheus.remote_write defined outside the module, which then sets this tenant's X-Scope-OrgID itself, another declare's exported receiver, or your own prometheus.relabel (default: unset, use the embedded remote_write)"
+		optional = true
+	}
+
 	argument "tenant_id" {
-		comment = "The tenant (X-Scope-OrgID) to write metrics to"
+		comment  = "The tenant (X-Scope-OrgID) for the embedded remote_write. Required unless forward_to is set."
+		optional = true
+		default  = ""
 	}
 
 	argument "endpoint_url" {
-		comment = "Prometheus-compatible remote_write URL (e.g. Mimir)"
+		comment  = "Prometheus-compatible remote_write URL (e.g. Mimir) for the embedded writer. Required unless forward_to is set; the default points at a local Mimir so a misconfiguration fails loudly with connection errors rather than silently discarding metrics."
+		optional = true
+		default  = "http://localhost:9009/api/v1/push"
 	}
-
+	// Alloy has no conditional blocks, so basic_auth is always present on the
+	// embedded endpoint. Left empty it sends an empty Basic header, which an
+	// endpoint without authentication ignores.
 	argument "endpoint_basic_auth_username" {
-		comment = "Basic-auth username for the remote_write endpoint"
+		comment  = "Basic-auth username for the embedded remote_write (default: \"\", no credentials)"
+		optional = true
+		default  = ""
 	}
 
 	argument "endpoint_basic_auth_password" {
-		comment = "Basic-auth password for the remote_write endpoint"
+		comment  = "Basic-auth password for the embedded remote_write (default: \"\", no credentials)"
+		optional = true
+		default  = ""
+	}
+
+	// -- Embedded remote_write queue and WAL --------------------------------
+	// Defaults are tuned below Alloy's own, which size every instance for a
+	// load it never sees: one queue shard covers normal load, and Mimir
+	// rejects samples older than its out-of-order window anyway, so holding
+	// hours of backlog only costs memory and disk. The trade-off: after an
+	// outage longer than an hour the unsent backlog older than that is dropped
+	// rather than replayed. Not used when forward_to is set.
+	argument "queue_max_shards" {
+		comment  = "Maximum concurrent queue shards sending to the endpoint (default: 10; Alloy's own is 50)"
+		optional = true
+		default  = 10
+	}
+
+	argument "queue_capacity" {
+		comment  = "Samples buffered per shard (default: 2500; Alloy's own is 10000)"
+		optional = true
+		default  = 2500
+	}
+
+	argument "queue_sample_age_limit" {
+		comment  = "Drop samples older than this instead of sending them (default: \"1h\"; \"0s\" disables it, Alloy's own default)"
+		optional = true
+		default  = "1h"
+	}
+
+	argument "wal_truncate_frequency" {
+		comment  = "How often the WAL is truncated (default: \"30m\"; Alloy's own is \"2h\")"
+		optional = true
+		default  = "30m"
+	}
+
+	argument "wal_max_keepalive_time" {
+		comment  = "Longest unsent data is kept in the WAL before it is dropped (default: \"1h\"; Alloy's own is \"8h\")"
+		optional = true
+		default  = "1h"
 	}
 
 	// -- Optional -----------------------------------------------------------
@@ -332,7 +485,7 @@ declare "crds" {
 
 	// Scrape ServiceMonitor CRDs scoped to this tenant's namespaces.
 	prometheus.operator.servicemonitors "sm" {
-		forward_to      = [prometheus.remote_write.default.receiver]
+		forward_to      = coalesce(argument.forward_to.value, [prometheus.remote_write.default.receiver])
 		namespaces      = argument.namespaces.value
 		kubernetes_role = argument.kubernetes_role.value
 
@@ -344,13 +497,19 @@ declare "crds" {
 
 	// Scrape Prometheus-Operator PodMonitor CRDs scoped to this tenant's namespaces.
 	prometheus.operator.podmonitors "pm" {
-		forward_to = [prometheus.remote_write.default.receiver]
+		forward_to = coalesce(argument.forward_to.value, [prometheus.remote_write.default.receiver])
 		namespaces = argument.namespaces.value
 
 		// Split PodMonitor targets across the Alloy cluster.
 		clustering {
 			enabled = true
 		}
+	}
+
+	// Exposed so other declares for the same tenant can share this one's
+	// remote_write through their forward_to.
+	export "receiver" {
+		value = prometheus.remote_write.default.receiver
 	}
 
 	prometheus.remote_write "default" {
@@ -365,12 +524,23 @@ declare "crds" {
 			headers = {
 				"X-Scope-OrgID" = argument.tenant_id.value,
 			}
+
+			queue_config {
+				max_shards       = argument.queue_max_shards.value
+				capacity         = argument.queue_capacity.value
+				sample_age_limit = argument.queue_sample_age_limit.value
+			}
 		}
 
 		external_labels = {
 			region       = coalesce(argument.region.value, ""),
 			zone         = coalesce(argument.zone.value, ""),
 			cluster_name = coalesce(argument.cluster_name.value, ""),
+		}
+
+		wal {
+			truncate_frequency = argument.wal_truncate_frequency.value
+			max_keepalive_time = argument.wal_max_keepalive_time.value
 		}
 	}
 }
@@ -382,20 +552,74 @@ declare "annotations" {
 		comment = "The namespaces to look for annotated pods in"
 	}
 
+	// -- Delivery: embedded remote_write, or forward_to ---------------------
+	// An explicit [] coalesces to the default -- pass a real receiver, or omit.
+	argument "forward_to" {
+		comment  = "list(MetricsReceiver) to send metrics to INSTEAD of the embedded remote_write: a prometheus.remote_write defined outside the module, which then sets this tenant's X-Scope-OrgID itself, another declare's exported receiver, or your own prometheus.relabel (default: unset, use the embedded remote_write)"
+		optional = true
+	}
+
 	argument "tenant_id" {
-		comment = "The tenant (X-Scope-OrgID) to write metrics to"
+		comment  = "The tenant (X-Scope-OrgID) for the embedded remote_write. Required unless forward_to is set."
+		optional = true
+		default  = ""
 	}
 
 	argument "endpoint_url" {
-		comment = "Prometheus-compatible remote_write URL (e.g. Mimir)"
+		comment  = "Prometheus-compatible remote_write URL (e.g. Mimir) for the embedded writer. Required unless forward_to is set; the default points at a local Mimir so a misconfiguration fails loudly with connection errors rather than silently discarding metrics."
+		optional = true
+		default  = "http://localhost:9009/api/v1/push"
 	}
-
+	// Alloy has no conditional blocks, so basic_auth is always present on the
+	// embedded endpoint. Left empty it sends an empty Basic header, which an
+	// endpoint without authentication ignores.
 	argument "endpoint_basic_auth_username" {
-		comment = "Basic-auth username for the remote_write endpoint"
+		comment  = "Basic-auth username for the embedded remote_write (default: \"\", no credentials)"
+		optional = true
+		default  = ""
 	}
 
 	argument "endpoint_basic_auth_password" {
-		comment = "Basic-auth password for the remote_write endpoint"
+		comment  = "Basic-auth password for the embedded remote_write (default: \"\", no credentials)"
+		optional = true
+		default  = ""
+	}
+
+	// -- Embedded remote_write queue and WAL --------------------------------
+	// Defaults are tuned below Alloy's own, which size every instance for a
+	// load it never sees: one queue shard covers normal load, and Mimir
+	// rejects samples older than its out-of-order window anyway, so holding
+	// hours of backlog only costs memory and disk. The trade-off: after an
+	// outage longer than an hour the unsent backlog older than that is dropped
+	// rather than replayed. Not used when forward_to is set.
+	argument "queue_max_shards" {
+		comment  = "Maximum concurrent queue shards sending to the endpoint (default: 10; Alloy's own is 50)"
+		optional = true
+		default  = 10
+	}
+
+	argument "queue_capacity" {
+		comment  = "Samples buffered per shard (default: 2500; Alloy's own is 10000)"
+		optional = true
+		default  = 2500
+	}
+
+	argument "queue_sample_age_limit" {
+		comment  = "Drop samples older than this instead of sending them (default: \"1h\"; \"0s\" disables it, Alloy's own default)"
+		optional = true
+		default  = "1h"
+	}
+
+	argument "wal_truncate_frequency" {
+		comment  = "How often the WAL is truncated (default: \"30m\"; Alloy's own is \"2h\")"
+		optional = true
+		default  = "30m"
+	}
+
+	argument "wal_max_keepalive_time" {
+		comment  = "Longest unsent data is kept in the WAL before it is dropped (default: \"1h\"; Alloy's own is \"8h\")"
+		optional = true
+		default  = "1h"
 	}
 
 	// -- Optional -----------------------------------------------------------
@@ -495,7 +719,7 @@ declare "annotations" {
 
 	prometheus.scrape "pods" {
 		targets    = discovery.relabel.pods.output
-		forward_to = [prometheus.remote_write.default.receiver]
+		forward_to = coalesce(argument.forward_to.value, [prometheus.remote_write.default.receiver])
 
 		scrape_interval = "30s"
 		scrape_timeout  = "10s"
@@ -504,6 +728,12 @@ declare "annotations" {
 		clustering {
 			enabled = true
 		}
+	}
+
+	// Exposed so other declares for the same tenant can share this one's
+	// remote_write through their forward_to.
+	export "receiver" {
+		value = prometheus.remote_write.default.receiver
 	}
 
 	prometheus.remote_write "default" {
@@ -518,12 +748,23 @@ declare "annotations" {
 			headers = {
 				"X-Scope-OrgID" = argument.tenant_id.value,
 			}
+
+			queue_config {
+				max_shards       = argument.queue_max_shards.value
+				capacity         = argument.queue_capacity.value
+				sample_age_limit = argument.queue_sample_age_limit.value
+			}
 		}
 
 		external_labels = {
 			region       = coalesce(argument.region.value, ""),
 			zone         = coalesce(argument.zone.value, ""),
 			cluster_name = coalesce(argument.cluster_name.value, ""),
+		}
+
+		wal {
+			truncate_frequency = argument.wal_truncate_frequency.value
+			max_keepalive_time = argument.wal_max_keepalive_time.value
 		}
 	}
 }
