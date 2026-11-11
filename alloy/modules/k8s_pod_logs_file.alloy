@@ -403,8 +403,13 @@ declare "kubernetes" {
 		}
 
 		// Auth material commonly leaked in request/response logs.
+		//stage.replace {
+		//	expression = `(?i)\[?"?(?:access-token|signature|x-envoy-peer-metadata)"?\]?\s?:\s?\[?"?\s?([A-Za-z0-9\-._+\/]+={0,2})["']?\]?`
+		//	replace    = "[REDACTED]"
+		//}
+
 		stage.replace {
-			expression = `(?i)\[?"?(?:access-token|signature|x-envoy-peer-metadata)"?\]?\s?:\s?\[?"?\s?([A-Za-z0-9\-._+\/]+={0,2})["']?\]?`
+			expression = `(?i)\[?"?(?:x-envoy-peer-metadata)"?\]?\s?:\s?\[?"?\s?([A-Za-z0-9\-._+\/]+={0,2})["']?\]?`
 			replace    = "[REDACTED]"
 		}
 
